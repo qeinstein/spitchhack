@@ -6,6 +6,7 @@ import os
 import base64
 import uuid
 import tempfile
+import re
 import glob
 import time
 from spitch import Spitch
@@ -92,7 +93,7 @@ async def start_call():
             action="/process_response",
             method="POST",
             speechTimeout="auto",
-            timeout=10
+            timeout=5
         )
         gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
         twiml.append(gather)
