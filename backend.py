@@ -39,8 +39,7 @@ else:
 
 load_dotenv()
 try:
-    SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
-    spitch_client = Spitch(api_key=SPITCH_API_KEY)
+    spitch_client = Spitch(api_key=os.getenv("SPITCH_API_KEY"))
     openrouter_client = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -68,26 +67,6 @@ def cleanup_static_files(max_age_seconds=3600):
                 logger.info(f"Deleted old file: {file}")
     except Exception as e:
         logger.error(f"Failed to clean up static files: {e}")
-
-def spitch_translate(text: str, source_language: str, target_language: str) -> str:
-    """Call Spitch translation API directly."""
-    try:
-        url = "https://api.spi-tch.com/v1/translate"
-        headers = {
-            "Authorization": f"Bearer {SPITCH_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "text": text,
-            "source_language": source_language,
-            "target_language": target_language
-        }
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json().get("translated_text", "")
-    except Exception as e:
-        logger.error(f"Spitch translation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Spitch translation failed: {str(e)}")
 
 @app.post("/start_call")
 async def start_call():
@@ -162,11 +141,12 @@ async def process_response(
                 logger.error("Transcription failed or returned empty text")
                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
 
-            english_text = spitch_translate(
+            translation_to_en = spitch_client.text.translate(
                 text=transcribed_text,
-                source_language=language,
-                target_language="en"
+                source=language,
+                target="en"
             )
+            english_text = translation_to_en.text
 
             mistral_response = openrouter_client.chat.completions.create(
                 model=MODEL,
@@ -177,11 +157,12 @@ async def process_response(
             )
             english_response = mistral_response.choices[0].message.content
 
-            translated_response = spitch_translate(
+            translation_back = spitch_client.text.translate(
                 text=english_response,
-                source_language="en",
-                target_language=language
+                source="en",
+                target=language
             )
+            translated_response = translation_back.text
 
             voice = VOICE_MAP.get(language, DEFAULT_VOICE)
             tts_audio = spitch_client.speech.generate(
@@ -234,11 +215,12 @@ async def process_response(
             detected_lang = mistral_response.choices[0].message.content.strip().lower()
 
             english_response = f"Okay, we will speak in {detected_lang}."
-            translated_response = spitch_translate(
+            translation_back = spitch_client.text.translate(
                 text=english_response,
-                source_language="en",
-                target_language=detected_lang
+                source="en",
+                target=detected_lang
             )
+            translated_response = translation_back.text
 
             voice = VOICE_MAP.get(detected_lang, DEFAULT_VOICE)
             tts_audio = spitch_client.speech.generate(
