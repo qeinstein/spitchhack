@@ -1,14 +1,23 @@
 from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles
 import io
 import os
 import base64
+import uuid  # For unique file names
 from spitch import Spitch
 from openai import OpenAI
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
 app = FastAPI()
+
+# Mount a static directory to serve audio files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Ensure static directory exists
+if not os.path.exists("static"):
+    os.makedirs("static")
 
 load_dotenv()
 spitch_client = Spitch(api_key=os.getenv("SPITCH_API_KEY"))
@@ -37,19 +46,23 @@ async def start_call():
         voice=DEFAULT_VOICE
     )
     audio_bytes = audio_response.read()
-    base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
 
+    # Save audio to a file
+    audio_filename = f"static/start_call_{uuid.uuid4()}.wav"
+    with open(audio_filename, "wb") as f:
+        f.write(audio_bytes)
+
+    # Create TwiML response with external audio URL
     twiml = VoiceResponse()
     gather = Gather(
-        input="speech",  # Allow speech input
+        input="speech",
         action="/process_response",
         method="POST",
-        speechTimeout="auto",  # Stop prompt when user speaks
-        timeout=10  # Max wait for user input (seconds)
+        speechTimeout="auto",
+        timeout=10
     )
-    gather.play(url=f"data:audio/wav;base64,{base64_audio}")
+    gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
     twiml.append(gather)
-    # Fallback if no input
     twiml.say("Sorry, I didn't catch that. Please try again.", voice="Polly.Joanna")
     twiml.redirect("/start_call", method="POST")
     return Response(content=str(twiml), media_type="application/xml")
@@ -59,10 +72,10 @@ async def process_response(
     audio: UploadFile = None,
     language: str = Form(None),
     RecordingUrl: str = Form(None),
-    SpeechResult: str = Form(None)  # For Gather speech input
+    SpeechResult: str = Form(None)
 ):
     """Processes user audio response."""
-    if SpeechResult:  # Handle Gather speech input
+    if SpeechResult:
         transcribed_text = SpeechResult
         audio_io = None
     elif RecordingUrl:
@@ -75,7 +88,6 @@ async def process_response(
         audio_io = io.BytesIO(audio_bytes)
 
     if language is not None:
-        # Ongoing conversation: Transcribe in specified language
         if audio_io:
             transcription = spitch_client.speech.transcribe(
                 content=audio_io,
@@ -113,7 +125,11 @@ async def process_response(
             voice=voice
         )
         audio_bytes = tts_audio.read()
-        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+
+        # Save audio to a file
+        audio_filename = f"static/response_{uuid.uuid4()}.wav"
+        with open(audio_filename, "wb") as f:
+            f.write(audio_bytes)
 
         twiml = VoiceResponse()
         gather = Gather(
@@ -123,13 +139,12 @@ async def process_response(
             speechTimeout="auto",
             timeout=10
         )
-        gather.play(url=f"data:audio/wav;base64,{base64_audio}")
+        gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
         twiml.append(gather)
         twiml.redirect(f"/process_response?language={language}", method="POST")
         return Response(content=str(twiml), media_type="application/xml")
 
     else:
-        # Initial response: Transcribe in English
         if audio_io:
             transcription = spitch_client.speech.transcribe(
                 content=audio_io,
@@ -163,7 +178,11 @@ async def process_response(
             voice=voice
         )
         audio_bytes = tts_audio.read()
-        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+
+        # Save audio to a file
+        audio_filename = f"static/response_{uuid.uuid4()}.wav"
+        with open(audio_filename, "wb") as f:
+            f.write(audio_bytes)
 
         twiml = VoiceResponse()
         gather = Gather(
@@ -173,7 +192,7 @@ async def process_response(
             speechTimeout="auto",
             timeout=10
         )
-        gather.play(url=f"data:audio/wav;base64,{base64_audio}")
+        gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
         twiml.append(gather)
         twiml.redirect(f"/process_response?language={detected_lang}", method="POST")
         return Response(content=str(twiml), media_type="application/xml")
