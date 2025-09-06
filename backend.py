@@ -221,17 +221,18 @@ async def process_response(
                 ]
             )
             detected_lang = mistral_response.choices[0].message.content.strip().lower()
+            cleaned = re.sub(r'[^a-zA-Z]', '', detected_lang)
 
             # Validate detected language
-            if detected_lang not in VALID_LANGUAGES:
-                logger.error(f"Invalid language detected: {detected_lang}")
-                raise HTTPException(status_code=400, detail=f"Detected language '{detected_lang}' is not supported. Supported: {VALID_LANGUAGES}")
+            if cleaned not in VALID_LANGUAGES:
+                logger.error(f"Invalid language detected: {cleaned}")
+                raise HTTPException(status_code=400, detail=f"Detected language '{cleaned}' is not supported. Supported: {VALID_LANGUAGES}")
 
             english_response = f"Okay, we will speak in {detected_lang}."
             translation_back = spitch_client.text.translate(
                 text=english_response,
                 source="en",
-                target=detected_lang
+                target=cleaned
             )
             translated_response = translation_back.text
 
