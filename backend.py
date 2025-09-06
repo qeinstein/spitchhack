@@ -4,20 +4,27 @@ from fastapi.staticfiles import StaticFiles
 import io
 import os
 import base64
-import uuid  # For unique file names
+import uuid
 from spitch import Spitch
 from openai import OpenAI
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Gather
+import tempfile  # For temporary file handling
 
 app = FastAPI()
 
-# Mount a static directory to serve audio files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Ensure static directory exists with error handling
+STATIC_DIR = "static"
+try:
+    os.makedirs(STATIC_DIR, exist_ok=True)  # Create if doesn't exist
+except Exception as e:
+    print(f"Failed to create static directory: {e}")
 
-# Ensure static directory exists
-if not os.path.exists("static"):
-    os.makedirs("static")
+# Mount static directory only if it exists
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+else:
+    raise RuntimeError(f"Cannot mount static directory: {STATIC_DIR} does not exist")
 
 load_dotenv()
 spitch_client = Spitch(api_key=os.getenv("SPITCH_API_KEY"))
@@ -47,12 +54,11 @@ async def start_call():
     )
     audio_bytes = audio_response.read()
 
-    # Save audio to a file
-    audio_filename = f"static/start_call_{uuid.uuid4()}.wav"
-    with open(audio_filename, "wb") as f:
-        f.write(audio_bytes)
+    # Save audio to a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".wav", dir=STATIC_DIR, delete=False) as temp_file:
+        temp_file.write(audio_bytes)
+        audio_filename = f"static/{os.path.basename(temp_file.name)}"
 
-    # Create TwiML response with external audio URL
     twiml = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -126,10 +132,9 @@ async def process_response(
         )
         audio_bytes = tts_audio.read()
 
-        # Save audio to a file
-        audio_filename = f"static/response_{uuid.uuid4()}.wav"
-        with open(audio_filename, "wb") as f:
-            f.write(audio_bytes)
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir=STATIC_DIR, delete=False) as temp_file:
+            temp_file.write(audio_bytes)
+            audio_filename = f"static/{os.path.basename(temp_file.name)}"
 
         twiml = VoiceResponse()
         gather = Gather(
@@ -179,10 +184,9 @@ async def process_response(
         )
         audio_bytes = tts_audio.read()
 
-        # Save audio to a file
-        audio_filename = f"static/response_{uuid.uuid4()}.wav"
-        with open(audio_filename, "wb") as f:
-            f.write(audio_bytes)
+        with tempfile.NamedTemporaryFile(suffix=".wav", dir=STATIC_DIR, delete=False) as temp_file:
+            temp_file.write(audio_bytes)
+            audio_filename = f"static/{os.path.basename(temp_file.name)}"
 
         twiml = VoiceResponse()
         gather = Gather(
