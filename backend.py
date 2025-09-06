@@ -204,7 +204,7 @@ async def process_response(
                 logger.error("Transcription failed or returned empty text")
                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
 
-            detection_prompt = f"The user said: '{transcribed_text}'. What language do they want to speak in? Respond with the ISO 639-1 code (e.g., 'ha' for Hausa)."
+            detection_prompt = f"The user said: '{transcribed_text}'. What language do they want to speak in? Respond with the ISO 639-1 code (e.g., 'ha' for Hausa).... please make sure you are only returning the code"
             mistral_response = openrouter_client.chat.completions.create(
                 model=MODEL,
                 messages=[
