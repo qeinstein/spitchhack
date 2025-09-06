@@ -1,525 +1,183 @@
-# app_low_latency_spitch.py
 import os
-import io
 import json
-import time
-import uuid
-import glob
-import base64
-import wave
 import logging
 import asyncio
-import tempfile
-from typing import Dict, Any, Optional
-
-import numpy as np
-from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, Form, Request
+import websockets
+import aiohttp
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
-from fastapi.staticfiles import StaticFiles
-from twilio.twiml.voice_response import VoiceResponse, Gather, Start
-from twilio.rest import Client as TwilioClient
-import requests
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from websockets.exceptions import ConnectionClosed
 
-# Spitch / OpenRouter imports (must match your SDK)
-from spitch import Spitch
-from openai import OpenAI
+# ----------------------------
+# Logging Setup
+# ----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("WagwanAI")
 
-load_dotenv()
-
-# ---------- Config ----------
+# ----------------------------
+# Environment Variables
+# ----------------------------
 SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # public https URL
-MODEL = os.getenv("MODEL", "mistralai/mistral-7b-instruct:free")
+SPITCH_WS_URL = "wss://api.spitch.io/realtime"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-STATIC_DIR = os.getenv("STATIC_DIR", "static")
-CHUNK_MS = int(os.getenv("CHUNK_MS", "800"))  # how many ms to accumulate before sending chunk (800ms default)
-SILENCE_SECONDS = float(os.getenv("SILENCE_SECONDS", "1.0"))
-SILENCE_ENERGY_THRESHOLD = float(os.getenv("SILENCE_ENERGY_THRESHOLD", "0.0012"))
-SAMPLE_RATE = 8000  # Twilio streams µ-law @ 8kHz
-MAX_FILE_AGE = int(os.getenv("MAX_FILE_AGE", "300"))
-
-if not BASE_URL:
-    raise RuntimeError("Set BASE_URL to your public HTTPS URL for Twilio to fetch static audio.")
-
-if not (SPITCH_API_KEY and OPENROUTER_API_KEY and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
-    raise RuntimeError("Set SPITCH_API_KEY, OPENROUTER_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN")
-
-# ---------- Clients ----------
-spitch_client = Spitch(api_key=SPITCH_API_KEY)
-openrouter_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# ---------- App ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ll-spitch")
+# ----------------------------
+# FastAPI App
+# ----------------------------
 app = FastAPI()
-os.makedirs(STATIC_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# ---------- Languages / Voices ----------
-LANGUAGE_MAP = {"1": ("Yoruba", "yo"), "2": ("Igbo", "ig"), "3": ("Hausa", "ha"), "4": ("English", "en")}
-VOICE_MAP = {"en": "jude", "ha": "aliyu", "yo": "femi", "ig": "obinna", "am": "default"}
-DEFAULT_VOICE = "jude"
+# ----------------------------
+# Conversation State
+# ----------------------------
+class ConversationState:
+    def __init__(self):
+        self.language = "en"
+        self.transcripts = []
+        self.last_partial = ""
+        self.ai_task = None
+        self.ws = None
 
-# ---------- State ----------
-LANGUAGE_SELECTION: Dict[str, str] = {}   # CallSid -> lang code
-STREAM_STATE: Dict[str, Dict[str, Any]] = {}  # streamSid -> state
+session_state = ConversationState()
 
-# ---------- Utils (no audioop) ----------
-def cleanup_static_files(max_age: int = MAX_FILE_AGE):
-    now = time.time()
-    for path in glob.glob(os.path.join(STATIC_DIR, "*.wav")):
-        try:
-            if os.path.getmtime(path) < now - max_age:
-                os.remove(path)
-                logger.info("Deleted old file: %s", path)
-        except Exception:
-            logger.exception("clean failure for %s", path)
-
-def save_wav(path: str, pcm16_bytes: bytes, sr: int = SAMPLE_RATE, channels: int = 1):
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(pcm16_bytes)
-
-def read_wav_bytes_to_pcm16(wav_bytes: bytes):
-    with io.BytesIO(wav_bytes) as b:
-        with wave.open(b, "rb") as wf:
-            channels = wf.getnchannels()
-            sr = wf.getframerate()
-            sampwidth = wf.getsampwidth()
-            frames = wf.readframes(wf.getnframes())
-            # Ensure 16-bit mono output
-            if sampwidth != 2:
-                # naive conversion for non-16-bit (rare)
-                frames = _any_to_int16(frames, sampwidth)
-            if channels != 1:
-                arr = np.frombuffer(frames, dtype=np.int16)
-                arr = arr.reshape(-1, channels)
-                mono = arr.mean(axis=1).astype(np.int16)
-                return mono.tobytes(), sr, 1
-            return frames, sr, channels
-
-def _any_to_int16(raw: bytes, sampwidth: int) -> bytes:
-    # fallback converters — not high-quality but works if needed
-    if sampwidth == 1:
-        arr = np.frombuffer(raw, dtype=np.uint8).astype(np.int16)
-        arr = (arr - 128) * 256
-        return arr.tobytes()
-    if sampwidth == 3:
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
-        # keep two most significant bytes (little-endian)
-        out = (arr[:, 2].astype(np.int16) << 8) | arr[:, 1].astype(np.int16)
-        return out.astype(np.int16).tobytes()
-    return raw  # assume 16-bit already
-
-# µ-law (G.711 u-law) encode/decode (vectorized with numpy)
-def mulaw_to_pcm16_bytes(mulaw_bytes: bytes) -> bytes:
-    mu = np.frombuffer(mulaw_bytes, dtype=np.uint8).astype(np.int16)
-    mu = ~mu & 0xFF
-    sign = mu & 0x80
-    exponent = (mu >> 4) & 0x07
-    mantissa = mu & 0x0F
-    magnitude = ((mantissa << (exponent + 3)) + (1 << (exponent + 3)) - 132).astype(np.int32)
-    pcm = np.where(sign == 0, magnitude, -magnitude).astype(np.int16)
-    return pcm.tobytes()
-
-def pcm16_to_mulaw_bytes(pcm16_bytes: bytes) -> bytes:
-    samples = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.int32)
-    sign = (samples >> 8) & 0x80
-    magnitude = np.abs(samples) + 132
-    # compute exponent (floor(log2(magnitude)))
-    exponent = np.floor(np.log2(magnitude + 1)).astype(np.int32)
-    exponent = np.minimum(exponent, 7)
-    mantissa = (magnitude >> (exponent + 3)) & 0x0F
-    mulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF
-    return mulaw.astype(np.uint8).tobytes()
-
-# simple linear resample (numpy)
-def resample_pcm16(pcm16_bytes: bytes, src_rate: int, tgt_rate: int = SAMPLE_RATE) -> bytes:
-    if src_rate == tgt_rate:
-        return pcm16_bytes
-    arr = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32)
-    if arr.size == 0:
-        return b""
-    duration = arr.shape[0] / src_rate
-    new_len = int(round(duration * tgt_rate))
-    if new_len <= 0:
-        return b""
-    old_idx = np.linspace(0, arr.shape[0] - 1, num=arr.shape[0])
-    new_idx = np.linspace(0, arr.shape[0] - 1, num=new_len)
-    new_arr = np.interp(new_idx, old_idx, arr).astype(np.int16)
-    return new_arr.tobytes()
-
-def energy_of_pcm16(pcm16_bytes: bytes) -> float:
-    if not pcm16_bytes:
-        return 0.0
-    arr = np.frombuffer(pcm16_bytes, dtype=np.int16).astype(np.float32)
-    if arr.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(arr * arr)) / 32768.0)
-
-# ---------- Spitch/OpenRouter wrappers ----------
-def spitch_transcribe_wav_bytes(wav_bytes: bytes, language: str = "en") -> str:
-    audio_io = io.BytesIO(wav_bytes)
-    transcription = spitch_client.speech.transcribe(content=audio_io, language=language)
-    text = getattr(transcription, "text", None)
-    if not text:
-        raise RuntimeError("Empty transcription from Spitch")
-    return text
-
-def spitch_tts_wav_bytes(text: str, language: str = "en", voice: Optional[str] = None) -> bytes:
-    if not voice:
-        voice = VOICE_MAP.get(language, DEFAULT_VOICE)
-    tts = spitch_client.speech.generate(text=text, language=language, voice=voice)
-    data = tts.read()
-    if not data:
-        raise RuntimeError("Empty TTS from Spitch")
-    return data
-
-def spitch_translate(text: str, source: str, target: str) -> str:
-    resp = spitch_client.text.translate(text=text, source=source, target=target)
-    t = getattr(resp, "text", None)
-    if not t:
-        raise RuntimeError("Empty translation from Spitch")
-    return t
-
-def openrouter_chat_reply(messages: list) -> str:
-    resp = openrouter_client.chat.completions.create(model=MODEL, messages=messages)
-    return resp.choices[0].message.content
-
-# ---------- IVR endpoints ----------
+# ----------------------------
+# STEP 1: Twilio IVR Entry
+# ----------------------------
 @app.post("/voice")
-async def voice_entry():
+async def voice_response(request: Request):
+    """Initial IVR prompt for language selection."""
     twiml = VoiceResponse()
-    gather = Gather(num_digits=1, action="/process_language", method="POST", timeout=8)
-    gather.say("Welcome to Proxy. For Yoruba press 1. For Igbo press 2. For Hausa press 3. For English press 4.")
+    gather = Gather(
+        num_digits=1,
+        action="/select_language",
+        method="POST",
+        timeout=5
+    )
+    gather.say("Welcome to Wagwan AI. Press 1 for Yoruba, 2 for Igbo, 3 for Hausa, or 4 for English.")
     twiml.append(gather)
-    twiml.say("We did not receive input.")
     twiml.redirect("/voice")
     return Response(content=str(twiml), media_type="application/xml")
 
-@app.post("/process_language")
-async def process_language(Digits: str = Form(None), CallSid: str = Form(None)):
+# ----------------------------
+# STEP 2: Handle Language Selection
+# ----------------------------
+@app.post("/select_language")
+async def select_language(request: Request):
+    """Handles selected language and begins streaming."""
+    form = await request.form()
+    choice = form.get("Digits")
+
+    lang_map = {
+        "1": "yo",  # Yoruba
+        "2": "ig",  # Igbo
+        "3": "ha",  # Hausa
+        "4": "en",  # English
+    }
+    session_state.language = lang_map.get(choice, "en")
+
     twiml = VoiceResponse()
-    if not Digits or Digits not in LANGUAGE_MAP:
-        twiml.say("Invalid selection. Redirecting.")
-        twiml.redirect("/voice")
-        return Response(content=str(twiml), media_type="application/xml")
-
-    name, code = LANGUAGE_MAP[Digits]
-    if CallSid:
-        LANGUAGE_SELECTION[CallSid] = code
-        logger.info("CallSid %s selected language %s", CallSid, code)
-    confirm = f"You selected {name}. Connecting you now."
-    try:
-        tts = spitch_tts_wav_bytes(confirm, language=code)
-        fname = f"confirm-{CallSid or 'anon'}-{uuid.uuid4().hex}.wav"
-        path = os.path.join(STATIC_DIR, fname)
-        with open(path, "wb") as f:
-            f.write(tts)
-            f.flush()
-            os.fsync(f.fileno())
-        twiml.play(f"{BASE_URL}/static/{fname}")
-    except Exception:
-        logger.exception("TTS for confirmation failed; falling back to say()")
-        twiml.say(confirm)
-
-    # instruct Twilio to start media stream to our WS
-    if BASE_URL.startswith("https://"):
-        wss = BASE_URL.replace("https://", "wss://")
-    elif BASE_URL.startswith("http://"):
-        wss = BASE_URL.replace("http://", "ws://")
-    else:
-        wss = BASE_URL
-    start = Start()
-    start.stream(url=f"{wss}/ws/twilio_stream")
-    twiml.append(start)
+    twiml.say(f"Okay. You selected {session_state.language}. Start speaking after the beep.")
+    start = twiml.start()
+    start.stream(url="wss://your-domain.com/ws-audio")
     twiml.pause(length=60)
-    cleanup_static_files()
     return Response(content=str(twiml), media_type="application/xml")
 
-# ---------- WebSocket handler (Twilio Media Streams) ----------
-@app.websocket("/ws/twilio_stream")
-async def ws_twilio_stream(ws: WebSocket):
+# ----------------------------
+# STEP 3: WebSocket Audio Bridge
+# ----------------------------
+@app.websocket("/ws-audio")
+async def audio_ws(ws: WebSocket):
+    """Handles Twilio <-> Spitch real-time streaming."""
     await ws.accept()
-    logger.info("WS accepted from Twilio Media Streams")
-    stream_sid = None
-    call_sid = None
+    session_state.ws = ws
+    logger.info("Twilio connected to WebSocket.")
+
     try:
-        async for raw in ws.iter_text():
-            frame = json.loads(raw)
-            event = frame.get("event")
-            if event == "start":
-                start = frame.get("start", {})
-                stream_sid = start.get("streamSid")
-                call_sid = start.get("callSid")
-                lang = LANGUAGE_SELECTION.pop(call_sid, None) or "en"
-                STREAM_STATE[stream_sid] = {
-                    "callSid": call_sid,
-                    "websocket": ws,
-                    "ws_send_lock": asyncio.Lock(),
-                    "buffer": bytearray(),
-                    "last_received": time.time(),
-                    "processing": False,
-                    "lang": lang,
-                    "accum_transcript": "",  # incremental transcript assembled from chunks
-                }
-                logger.info("Stream started %s (call %s) language=%s", stream_sid, call_sid, lang)
-                continue
+        async with websockets.connect(
+            SPITCH_WS_URL,
+            extra_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
+        ) as spitch_ws:
+            listener_task = asyncio.create_task(spitch_listener(spitch_ws, ws))
 
-            if event == "media":
-                sid = frame.get("streamSid") or stream_sid
-                media = frame.get("media", {})
-                payload_b64 = media.get("payload")
-                if not payload_b64 or sid not in STREAM_STATE:
-                    continue
-                try:
-                    ulaw = base64.b64decode(payload_b64)
-                except Exception:
-                    logger.exception("b64 decode failed")
-                    continue
-                # convert µ-law to PCM16 bytes
-                try:
-                    pcm16 = mulaw_to_pcm16_bytes(ulaw)
-                except Exception:
-                    logger.exception("mulaw->pcm conversion failed")
-                    continue
+            while True:
+                audio_msg = await ws.receive_bytes()
+                await spitch_ws.send(audio_msg)
 
-                st = STREAM_STATE[sid]
-                st["buffer"].extend(pcm16)
-                st["last_received"] = time.time()
+    except ConnectionClosed:
+        logger.warning("Twilio WebSocket closed.")
+    except Exception as e:
+        logger.error(f"Audio WS error: {e}")
 
-                # If chunk > CHUNK_MS or VAD energy threshold met, schedule immediate chunk processing
-                buffered_ms = (len(st["buffer"]) / 2) / SAMPLE_RATE * 1000.0  # bytes -> samples (2 bytes/sample) -> ms
-                energy = energy_of_pcm16(bytes(st["buffer"][-int(SAMPLE_RATE * 0.05 * 2):]))  # energy of last 50ms window
-                if (buffered_ms >= CHUNK_MS) or (energy > SILENCE_ENERGY_THRESHOLD and buffered_ms >= 250):
-                    # spawn worker to quickly process the earliest CHUNK_MS ms from buffer
-                    if not st["processing"]:
-                        st["processing"] = True
-                        asyncio.create_task(_fast_chunk_worker(sid))
-                continue
-
-            if event == "stop":
-                sid = frame.get("streamSid")
-                logger.info("Stream stop %s", sid)
-                if sid in STREAM_STATE:
-                    # process all remaining audio as final utterance
-                    asyncio.create_task(_finalize_and_reply(sid))
-                    asyncio.create_task(_cleanup_stream_state(sid, delay=2.0))
-                continue
-
-            if event == "mark":
-                logger.info("Mark event: %s", frame.get("mark"))
-                continue
-            # ignore other events
-    except Exception:
-        logger.exception("WebSocket error")
-    finally:
-        logger.info("WS closed stream=%s call=%s", stream_sid, call_sid)
-        try:
-            await ws.close()
-        except Exception:
-            pass
-        if stream_sid and stream_sid in STREAM_STATE:
-            del STREAM_STATE[stream_sid]
-
-# ---------- Fast chunk worker (low-latency) ----------
-async def _fast_chunk_worker(streamSid: str):
-    """
-    Take the earliest CHUNK_MS from buffer, build a small WAV, send to Spitch.transcribe,
-    append partial transcript to accum_transcript, and if VAD indicates final (silence after chunk),
-    trigger finalization. This short-circuits the long wait and gives earlier partial text for the model.
-    """
+# ----------------------------
+# STEP 4: Spitch Transcription Listener
+# ----------------------------
+async def spitch_listener(spitch_ws, twilio_ws):
+    """Listens to Spitch transcriptions and triggers AI replies."""
     try:
-        state = STREAM_STATE.get(streamSid)
-        if not state:
-            return
-        # compute how many bytes correspond to CHUNK_MS
-        samples_needed = int(CHUNK_MS * SAMPLE_RATE / 1000.0)
-        bytes_needed = samples_needed * 2  # 2 bytes per sample
-        # take bytes_needed from the start of buffer
-        buf = state["buffer"]
-        if len(buf) < bytes_needed:
-            state["processing"] = False
-            return
-        chunk = buf[:bytes_needed]
-        # remove from buffer
-        state["buffer"] = bytearray(buf[bytes_needed:])
-        # quick VAD on chunk
-        e = energy_of_pcm16(chunk)
-        logger.debug("Chunk energy=%s for stream %s", e, streamSid)
-        # save chunk to wav bytes (16-bit PCM @ SAMPLE_RATE)
-        with io.BytesIO() as b:
-            with wave.open(b, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(chunk)
-            wav_bytes = b.getvalue()
-        # send chunk to Spitch for transcription (async via thread pool to not block)
-        loop = asyncio.get_running_loop()
-        try:
-            transcribed = await loop.run_in_executor(None, spitch_transcribe_wav_bytes, wav_bytes, state["lang"])
-            logger.info("Partial transcribed (stream %s): %s", streamSid, transcribed)
-        except Exception as e:
-            logger.exception("Spitch chunk transcribe failed: %s", e)
-            state["processing"] = False
-            return
+        async for msg in spitch_ws:
+            data = json.loads(msg)
 
-        # Append to accumulated transcript (simple concatenation)
-        # Real systems should do smarter partial merging, but that's OK here.
-        state["accum_transcript"] = (state.get("accum_transcript") + " " + transcribed).strip()
+            # Handle partial transcriptions
+            if data.get("type") == "partial":
+                transcript = data["alternatives"][0]["transcript"]
+                if transcript != session_state.last_partial:
+                    session_state.last_partial = transcript
+                    logger.info(f"Partial: {transcript}")
 
-        # If chunk energy is low (silence) then finalize immediately
-        if e < SILENCE_ENERGY_THRESHOLD:
-            # finalize reply
-            await _finalize_and_reply(streamSid)
-        else:
-            # small delay to allow more audio to arrive; clear processing flag
-            await asyncio.sleep(0.05)
-            state["processing"] = False
-    except Exception:
-        logger.exception("_fast_chunk_worker top error for %s", streamSid)
-        if streamSid in STREAM_STATE:
-            STREAM_STATE[streamSid]["processing"] = False
+                    # Stream AI reply ASAP
+                    if not session_state.ai_task:
+                        session_state.ai_task = asyncio.create_task(
+                            stream_ai_reply(transcript, twilio_ws)
+                        )
 
-# ---------- Finalization: produce model reply and TTS ----------
-async def _finalize_and_reply(streamSid: str):
-    """
-    Called when the system judges the user has finished speaking.
-    Uses accumulated transcript, queries model, optionally translates, generates TTS,
-    and returns audio back to Twilio via websocket media message.
-    """
+            # Handle final transcription
+            elif data.get("type") == "final":
+                final_text = data["alternatives"][0]["transcript"]
+                logger.info(f"Final: {final_text}")
+                session_state.transcripts.append(final_text)
+                session_state.ai_task = None  # Reset AI streaming for next utterance
+
+    except Exception as e:
+        logger.error(f"Spitch listener failed: {e}")
+
+# ----------------------------
+# STEP 5: AI Realtime Streaming
+# ----------------------------
+async def stream_ai_reply(prompt: str, twilio_ws):
+    """Streams AI response tokens directly to Twilio."""
     try:
-        state = STREAM_STATE.get(streamSid)
-        if not state:
-            return
-        # gather remaining buffer into final wav
-        remaining = bytes(state["buffer"])
-        state["buffer"] = bytearray()
-        if remaining:
-            # append remaining to accum_transcript via quick transcription
-            with io.BytesIO() as b:
-                with wave.open(b, "wb") as wf:
-                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes(remaining)
-                wav_bytes = b.getvalue()
-            loop = asyncio.get_running_loop()
-            try:
-                extra = await loop.run_in_executor(None, spitch_transcribe_wav_bytes, wav_bytes, state["lang"])
-                state["accum_transcript"] = (state.get("accum_transcript") + " " + extra).strip()
-                logger.info("Final appended transcription for %s: %s", streamSid, extra)
-            except Exception:
-                logger.exception("Final chunk transcribe failed; continuing with accumulated transcript")
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
-        user_lang = state.get("lang", "en")
-        text_for_model = state.get("accum_transcript", "").strip()
-        if not text_for_model:
-            logger.info("No transcript to respond to for %s", streamSid)
-            return
+        payload = {
+            "model": "gpt-4o-mini",
+            "stream": True,
+            "messages": [{"role": "user", "content": prompt}],
+        }
 
-        # prepare model input (we can add system instructions)
-        messages = [{"role": "system", "content": "You are a helpful voice assistant."},
-                    {"role": "user", "content": text_for_model}]
-        loop = asyncio.get_running_loop()
-        try:
-            reply_en = await loop.run_in_executor(None, openrouter_chat_reply, messages)
-        except Exception:
-            logger.exception("Model call failed; using fallback")
-            reply_en = "Sorry, I couldn't process that."
+        async with aiohttp.ClientSession() as session:
+            async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as resp:
+                async for chunk in resp.content:
+                    if chunk:
+                        try:
+                            decoded = json.loads(chunk.decode().replace("data: ", ""))
+                            token = decoded.get("choices", [{}])[0].get("delta", {}).get("content")
+                            if token:
+                                logger.info(f"AI: {token}")
 
-        # translate back if needed
-        if user_lang != "en":
-            try:
-                reply_local = await loop.run_in_executor(None, spitch_translate, reply_en, "en", user_lang)
-            except Exception:
-                logger.exception("Translate back failed; using English reply")
-                reply_local = reply_en
-        else:
-            reply_local = reply_en
+                                # Send streaming token to Twilio TTS
+                                await twilio_ws.send_text(json.dumps({
+                                    "event": "media",
+                                    "media": {"text": token}
+                                }))
+                        except Exception:
+                            continue
 
-        # generate TTS (call Spitch)
-        try:
-            tts_wav = await loop.run_in_executor(None, spitch_tts_wav_bytes, reply_local, user_lang, VOICE_MAP.get(user_lang, DEFAULT_VOICE))
-        except Exception:
-            logger.exception("TTS generation failed")
-            return
-
-        # parse TTS wav -> pcm16 and ensure 8kHz
-        try:
-            pcm16_bytes, sr, ch = read_wav_bytes_to_pcm16(tts_wav)
-        except Exception:
-            logger.exception("Failed to parse TTS wav bytes")
-            return
-        if sr != SAMPLE_RATE:
-            try:
-                pcm16_bytes = resample_pcm16(pcm16_bytes, src_rate=sr, tgt_rate=SAMPLE_RATE)
-            except Exception:
-                logger.exception("Resample failed; using original sample rate")
-
-        # convert to µ-law and send back
-        try:
-            mulaw = pcm16_to_mulaw_bytes(pcm16_bytes)
-        except Exception:
-            logger.exception("PCM->mulaw conversion failed")
-            return
-
-        mulaw_b64 = base64.b64encode(mulaw).decode("ascii")
-        outbound = {"event": "media", "streamSid": streamSid, "media": {"payload": mulaw_b64}}
-        ws = state["websocket"]
-        lock: asyncio.Lock = state["ws_send_lock"]
-        async with lock:
-            try:
-                await ws.send_text(json.dumps(outbound))
-                logger.info("Sent reply media for %s (%d bytes)", streamSid, len(mulaw))
-                # send mark
-                mark_msg = {"event": "mark", "streamSid": streamSid, "mark": {"name": f"reply-{uuid.uuid4().hex[:8]}"}}
-                await ws.send_text(json.dumps(mark_msg))
-            except Exception:
-                logger.exception("Failed to send outbound media to Twilio for %s", streamSid)
-
-        # reset transcript for next turn
-        state["accum_transcript"] = ""
-        state["processing"] = False
-        cleanup_static_files()
-    except Exception:
-        logger.exception("_finalize_and_reply top-level error for %s", streamSid)
-        if streamSid in STREAM_STATE:
-            STREAM_STATE[streamSid]["processing"] = False
-
-async def _cleanup_stream_state(streamSid: str, delay: float = 2.0):
-    await asyncio.sleep(delay)
-    if streamSid in STREAM_STATE:
-        try:
-            del STREAM_STATE[streamSid]
-            logger.info("Cleaned state for %s", streamSid)
-        except Exception:
-            logger.exception("cleanup error for %s", streamSid)
-
-# ---------- Health ----------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    except Exception as e:
+        logger.error(f"AI streaming failed: {e}")
 
 
 
