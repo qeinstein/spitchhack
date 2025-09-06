@@ -2,10 +2,11 @@ from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import StreamingResponse, Response
 import io
 import os
+import base64
 from spitch import Spitch
 from openai import OpenAI
 from dotenv import load_dotenv
-from twilio.twiml.voice_response import VoiceResponse  # Add Twilio TwiML for call flow
+from twilio.twiml.voice_response import VoiceResponse, Gather
 
 app = FastAPI()
 
@@ -28,7 +29,7 @@ DEFAULT_VOICE = "jude"
 
 @app.post("/start_call")
 async def start_call():
-    """Asks user for preferred language and collects response."""
+    """Asks user for preferred language and allows interruption."""
     text = "What language do you want to speak in?"
     audio_response = spitch_client.speech.generate(
         text=text,
@@ -36,50 +37,60 @@ async def start_call():
         voice=DEFAULT_VOICE
     )
     audio_bytes = audio_response.read()
+    base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
 
-    # Create TwiML response to play audio and collect user input
     twiml = VoiceResponse()
-    twiml.play(url="data:audio/wav;base64," + audio_bytes.encode('base64'))  # Adjust URL if hosting audio
-    twiml.record(
-        action="/process_response",  # Next endpoint to handle user response
+    gather = Gather(
+        input="speech",  # Allow speech input
+        action="/process_response",
         method="POST",
-        max_length=10,  # Limit recording length (adjust as needed)
-        transcribe=False  # We'll use Spitch for transcription
+        speechTimeout="auto",  # Stop prompt when user speaks
+        timeout=10  # Max wait for user input (seconds)
     )
+    gather.play(url=f"data:audio/wav;base64,{base64_audio}")
+    twiml.append(gather)
+    # Fallback if no input
+    twiml.say("Sorry, I didn't catch that. Please try again.", voice="Polly.Joanna")
+    twiml.redirect("/start_call", method="POST")
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_response")
 async def process_response(
     audio: UploadFile = None,
     language: str = Form(None),
-    RecordingUrl: str = Form(None)  # For Twilio-recorded audio
+    RecordingUrl: str = Form(None),
+    SpeechResult: str = Form(None)  # For Gather speech input
 ):
     """Processes user audio response."""
-    # Handle Twilio's recorded audio if no direct UploadFile
-    if RecordingUrl:
+    if SpeechResult:  # Handle Gather speech input
+        transcribed_text = SpeechResult
+        audio_io = None
+    elif RecordingUrl:
         import requests
         audio_response = requests.get(RecordingUrl)
         audio_bytes = audio_response.content
+        audio_io = io.BytesIO(audio_bytes)
     else:
         audio_bytes = await audio.read()
-    audio_io = io.BytesIO(audio_bytes)
+        audio_io = io.BytesIO(audio_bytes)
 
     if language is not None:
         # Ongoing conversation: Transcribe in specified language
-        transcription = spitch_client.speech.transcribe(
-            content=audio_io,
-            language=language
-        )
-        transcribed_text = transcription.text
+        if audio_io:
+            transcription = spitch_client.speech.transcribe(
+                content=audio_io,
+                language=language
+            )
+            transcribed_text = transcription.text
+        else:
+            transcribed_text = SpeechResult
 
-        # Translate to English
         english_text = spitch_client.translation.translate(
             text=transcribed_text,
             source_language=language,
             target_language="en"
         )
 
-        # Process with Mistral
         mistral_response = openrouter_client.chat.completions.create(
             model=MODEL,
             messages=[
@@ -89,14 +100,12 @@ async def process_response(
         )
         english_response = mistral_response.choices[0].message.content
 
-        # Translate back to user's language
         translated_response = spitch_client.translation.translate(
             text=english_response,
             source_language="en",
             target_language=language
         )
 
-        # Generate TTS with language-specific voice
         voice = VOICE_MAP.get(language, DEFAULT_VOICE)
         tts_audio = spitch_client.speech.generate(
             text=translated_response,
@@ -104,22 +113,32 @@ async def process_response(
             voice=voice
         )
         audio_bytes = tts_audio.read()
+        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
 
-        # Return TwiML to play response and continue recording
         twiml = VoiceResponse()
-        twiml.play(url="data:audio/wav;base64," + audio_bytes.encode('base64'))
-        twiml.record(action="/process_response", method="POST", max_length=10)
+        gather = Gather(
+            input="speech",
+            action="/process_response",
+            method="POST",
+            speechTimeout="auto",
+            timeout=10
+        )
+        gather.play(url=f"data:audio/wav;base64,{base64_audio}")
+        twiml.append(gather)
+        twiml.redirect(f"/process_response?language={language}", method="POST")
         return Response(content=str(twiml), media_type="application/xml")
 
     else:
         # Initial response: Transcribe in English
-        transcription = spitch_client.speech.transcribe(
-            content=audio_io,
-            language="en"
-        )
-        transcribed_text = transcription.text
+        if audio_io:
+            transcription = spitch_client.speech.transcribe(
+                content=audio_io,
+                language="en"
+            )
+            transcribed_text = transcription.text
+        else:
+            transcribed_text = SpeechResult
 
-        # Detect language with Mistral
         detection_prompt = f"The user said: '{transcribed_text}'. What language do they want to speak in? Respond with the ISO 639-1 code (e.g., 'ha' for Hausa)."
         mistral_response = openrouter_client.chat.completions.create(
             model=MODEL,
@@ -130,7 +149,6 @@ async def process_response(
         )
         detected_lang = mistral_response.choices[0].message.content.strip().lower()
 
-        # Generate confirmation response
         english_response = f"Okay, we will speak in {detected_lang}."
         translated_response = spitch_client.translation.translate(
             text=english_response,
@@ -138,7 +156,6 @@ async def process_response(
             target_language=detected_lang
         )
 
-        # Generate TTS with language-specific voice
         voice = VOICE_MAP.get(detected_lang, DEFAULT_VOICE)
         tts_audio = spitch_client.speech.generate(
             text=translated_response,
@@ -146,15 +163,17 @@ async def process_response(
             voice=voice
         )
         audio_bytes = tts_audio.read()
+        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
 
-        # Return TwiML to play response and continue recording
         twiml = VoiceResponse()
-        twiml.play(url="data:audio/wav;base64," + audio_bytes.encode('base64'))
-        twiml.record(
-            action="/process_response",
+        gather = Gather(
+            input="speech",
+            action=f"/process_response?language={detected_lang}",
             method="POST",
-            max_length=10,
-            transcribe=False,
-            recording_status_callback="/process_response?language=" + detected_lang  # Pass language
+            speechTimeout="auto",
+            timeout=10
         )
+        gather.play(url=f"data:audio/wav;base64,{base64_audio}")
+        twiml.append(gather)
+        twiml.redirect(f"/process_response?language={detected_lang}", method="POST")
         return Response(content=str(twiml), media_type="application/xml")
