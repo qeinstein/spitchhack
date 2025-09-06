@@ -6,9 +6,9 @@ import os
 import base64
 import uuid
 import tempfile
-import re
 import glob
 import time
+import re
 from spitch import Spitch
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -53,10 +53,10 @@ MODEL = "mistralai/mistral-7b-instruct:free"
 
 VOICE_MAP = {
     "en": "jude",
-    "ha": "aliyu",  # Replace with actual Spitch Hausa voice
+    "ha": "aliyu",
     "yo": "femi",
     "ig": "obinna",
-    "am": "default"  # Add Amharic voice if supported
+    "am": "default"  # Replace with actual Spitch Amharic voice if supported
 }
 DEFAULT_VOICE = "jude"
 VALID_LANGUAGES = {"en", "ha", "yo", "ig", "am"}
@@ -70,6 +70,14 @@ def cleanup_static_files(max_age_seconds=3600):
                 logger.info(f"Deleted old file: {file}")
     except Exception as e:
         logger.error(f"Failed to clean up static files: {e}")
+
+def clean_language_code(lang: str) -> str:
+    """Clean language code to ensure it's a valid ISO 639-1 code."""
+    if not lang:
+        return None
+    # Remove quotes, whitespace, and non-lowercase letters
+    cleaned = re.sub(r'[^a-z]', '', lang.strip().lower())
+    return cleaned if cleaned in VALID_LANGUAGES else None
 
 @app.post("/start_call")
 async def start_call():
@@ -118,6 +126,15 @@ async def process_response(
             logger.error("No audio input provided (SpeechResult, RecordingUrl, or UploadFile)")
             raise HTTPException(status_code=400, detail="No audio input provided")
 
+        # Clean and validate language parameter if provided
+        if language is not None:
+            cleaned_language = clean_language_code(language)
+            if cleaned_language not in VALID_LANGUAGES:
+                logger.error(f"Invalid language parameter: {language}")
+                raise HTTPException(status_code=400, detail=f"Invalid language '{language}'. Supported: {VALID_LANGUAGES}")
+        else:
+            cleaned_language = None
+
         if SpeechResult:
             transcribed_text = SpeechResult
             audio_io = None
@@ -130,11 +147,11 @@ async def process_response(
             audio_bytes = await audio.read()
             audio_io = io.BytesIO(audio_bytes)
 
-        if language is not None:
+        if cleaned_language is not None:
             if audio_io:
                 transcription = spitch_client.speech.transcribe(
                     content=audio_io,
-                    language=language
+                    language=cleaned_language
                 )
                 transcribed_text = transcription.text
             else:
@@ -146,7 +163,7 @@ async def process_response(
 
             translation_to_en = spitch_client.text.translate(
                 text=transcribed_text,
-                source=language,
+                source=cleaned_language,
                 target="en"
             )
             english_text = translation_to_en.text
@@ -163,14 +180,14 @@ async def process_response(
             translation_back = spitch_client.text.translate(
                 text=english_response,
                 source="en",
-                target=language
+                target=cleaned_language
             )
             translated_response = translation_back.text
 
-            voice = VOICE_MAP.get(language, DEFAULT_VOICE)
+            voice = VOICE_MAP.get(cleaned_language, DEFAULT_VOICE)
             tts_audio = spitch_client.speech.generate(
                 text=translated_response,
-                language=language,
+                language=cleaned_language,
                 voice=voice
             )
             audio_bytes = tts_audio.read()
@@ -189,7 +206,7 @@ async def process_response(
             )
             gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
             twiml.append(gather)
-            twiml.redirect(f"/process_response?language={language}", method="POST")
+            twiml.redirect(f"/process_response?language={cleaned_language}", method="POST")
             cleanup_static_files()
             return Response(content=str(twiml), media_type="application/xml")
 
@@ -208,28 +225,28 @@ async def process_response(
                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
 
             # Refined prompt to ensure only ISO 639-1 code is returned
-            list = ["en", "yo", "ig", "ha", "am"]        
+            valid_languages = ["en", "yo", "ig", "ha", "am"]
             detection_prompt = (
                 f"The user said: '{transcribed_text}'. Identify the language they want to speak in and respond with "
-                f"only the ISO 639-1 code (e.g., 'ha' for Hausa, 'en' for English, 'yo' for Yoruba, 'ig' for Igbo, 'am' for Amharic)."
-                f"Make sure what you are returning is one of {list} with no modifications"
+                f"only the ISO 639-1 code (e.g., 'ha' for Hausa, 'en' for English, 'yo' for Yoruba, 'ig' for Igbo, 'am' for Amharic). "
+                f"Return exactly one of {valid_languages} with no additional text, quotes, or modifications."
             )
             mistral_response = openrouter_client.chat.completions.create(
                 model=MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a language detector. Respond with only the ISO 639-1 code."},
+                    {"role": "system", "content": "You are a language detector. Respond with only the ISO 639-1 code, without quotes or extra text."},
                     {"role": "user", "content": detection_prompt}
                 ]
             )
             detected_lang = mistral_response.choices[0].message.content.strip().lower()
-            cleaned = re.sub(r'[^a-zA-Z]', '', detected_lang)
+            cleaned = clean_language_code(detected_lang)
 
             # Validate detected language
             if cleaned not in VALID_LANGUAGES:
                 logger.error(f"Invalid language detected: {cleaned}")
                 raise HTTPException(status_code=400, detail=f"Detected language '{cleaned}' is not supported. Supported: {VALID_LANGUAGES}")
 
-            english_response = f"Okay, we will speak in {detected_lang}."
+            english_response = f"Okay, we will speak in {cleaned}."
             translation_back = spitch_client.text.translate(
                 text=english_response,
                 source="en",
@@ -237,10 +254,10 @@ async def process_response(
             )
             translated_response = translation_back.text
 
-            voice = VOICE_MAP.get(detected_lang, DEFAULT_VOICE)
+            voice = VOICE_MAP.get(cleaned, DEFAULT_VOICE)
             tts_audio = spitch_client.speech.generate(
                 text=translated_response,
-                language=detected_lang,
+                language=cleaned,
                 voice=voice
             )
             audio_bytes = tts_audio.read()
@@ -252,14 +269,14 @@ async def process_response(
             twiml = VoiceResponse()
             gather = Gather(
                 input="speech",
-                action=f"/process_response?language={detected_lang}",
+                action=f"/process_response?language={cleaned}",
                 method="POST",
                 speechTimeout="auto",
                 timeout=10
             )
             gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
             twiml.append(gather)
-            twiml.redirect(f"/process_response?language={detected_lang}", method="POST")
+            twiml.redirect(f"/process_response?language={cleaned}", method="POST")
             cleanup_static_files()
             return Response(content=str(twiml), media_type="application/xml")
 
