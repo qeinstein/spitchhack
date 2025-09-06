@@ -207,9 +207,11 @@ async def process_response(
                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
 
             # Refined prompt to ensure only ISO 639-1 code is returned
+            list = ["en", "yo", "ig", "ha", "am"]        
             detection_prompt = (
                 f"The user said: '{transcribed_text}'. Identify the language they want to speak in and respond with "
                 f"only the ISO 639-1 code (e.g., 'ha' for Hausa, 'en' for English, 'yo' for Yoruba, 'ig' for Igbo, 'am' for Amharic)."
+                f"Make sure what you are returning is one of {list} with no modifications"
             )
             mistral_response = openrouter_client.chat.completions.create(
                 model=MODEL,
