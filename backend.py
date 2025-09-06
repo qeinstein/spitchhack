@@ -50,6 +50,7 @@ if not SPITCH_API_KEY or not OPENROUTER_API_KEY or not TWILIO_ACCOUNT_SID or not
 # Clients
 # -----------------------
 spitch_client = Spitch(api_key=SPITCH_API_KEY)
+
 openrouter_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
