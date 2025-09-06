@@ -54,9 +54,11 @@ VOICE_MAP = {
     "en": "jude",
     "ha": "aliyu",  # Replace with actual Spitch Hausa voice
     "yo": "femi",
-    "ig": "obinna"
+    "ig": "obinna",
+    "am": "default"  # Add Amharic voice if supported
 }
 DEFAULT_VOICE = "jude"
+VALID_LANGUAGES = {"en", "ha", "yo", "ig", "am"}
 
 def cleanup_static_files(max_age_seconds=3600):
     """Clean up old audio files."""
@@ -204,15 +206,24 @@ async def process_response(
                 logger.error("Transcription failed or returned empty text")
                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
 
-            detection_prompt = f"The user said: '{transcribed_text}'. What language do they want to speak in? Respond with the ISO 639-1 code (e.g., 'ha' for Hausa).... please make sure you are only returning the code"
+            # Refined prompt to ensure only ISO 639-1 code is returned
+            detection_prompt = (
+                f"The user said: '{transcribed_text}'. Identify the language they want to speak in and respond with "
+                f"only the ISO 639-1 code (e.g., 'ha' for Hausa, 'en' for English, 'yo' for Yoruba, 'ig' for Igbo, 'am' for Amharic)."
+            )
             mistral_response = openrouter_client.chat.completions.create(
                 model=MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a language detector."},
+                    {"role": "system", "content": "You are a language detector. Respond with only the ISO 639-1 code."},
                     {"role": "user", "content": detection_prompt}
                 ]
             )
             detected_lang = mistral_response.choices[0].message.content.strip().lower()
+
+            # Validate detected language
+            if detected_lang not in VALID_LANGUAGES:
+                logger.error(f"Invalid language detected: {detected_lang}")
+                raise HTTPException(status_code=400, detail=f"Detected language '{detected_lang}' is not supported. Supported: {VALID_LANGUAGES}")
 
             english_response = f"Okay, we will speak in {detected_lang}."
             translation_back = spitch_client.text.translate(
