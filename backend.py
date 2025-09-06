@@ -71,13 +71,13 @@ def cleanup_static_files(max_age_seconds=3600):
     except Exception as e:
         logger.error(f"Failed to clean up static files: {e}")
 
-def clean_language_code(lang: str) -> str:
-    """Clean language code to ensure it's a valid ISO 639-1 code."""
-    if not lang:
-        return None
-    # Remove quotes, whitespace, and non-lowercase letters
-    cleaned = re.sub(r'[^a-z]', '', lang.strip().lower())
-    return cleaned if cleaned in VALID_LANGUAGES else None
+# def clean_language_code(lang: str) -> str:
+#     """Clean language code to ensure it's a valid ISO 639-1 code."""
+#     if not lang:
+#         return None
+#     # Remove quotes, whitespace, and non-lowercase letters
+#     cleaned = re.sub(r'[^a-z]', '', lang.strip().lower())
+#     return cleaned if cleaned in VALID_LANGUAGES else None
 
 @app.post("/start_call")
 async def start_call():
@@ -128,7 +128,7 @@ async def process_response(
 
         # Clean and validate language parameter if provided
         if language is not None:
-            cleaned_language = clean_language_code(language)
+            cleaned_language = "er" #clean_language_code(language) 
             if cleaned_language not in VALID_LANGUAGES:
                 logger.error(f"Invalid language parameter: {language}")
                 raise HTTPException(status_code=400, detail=f"Invalid language '{language}'. Supported: {VALID_LANGUAGES}")
@@ -238,14 +238,14 @@ async def process_response(
                     {"role": "user", "content": detection_prompt}
                 ]
             )
-            detected_lang = mistral_response.choices[0].message.content.strip().lower()
-            cleaned = clean_language_code(detected_lang)
+            # detected_lang = mistral_response.choices[0].message.content.strip().lower()
+            # cleaned = clean_language_code(detected_lang)
 
-            # Validate detected language
-            if cleaned not in VALID_LANGUAGES:
-                logger.error(f"Invalid language detected: {cleaned}")
-                raise HTTPException(status_code=400, detail=f"Detected language '{cleaned}' is not supported. Supported: {VALID_LANGUAGES}")
-
+            # # Validate detected language
+            # if cleaned not in VALID_LANGUAGES:
+            #     logger.error(f"Invalid language detected: {cleaned}")
+            #     raise HTTPException(status_code=400, detail=f"Detected language '{cleaned}' is not supported. Supported: {VALID_LANGUAGES}")
+            cleaned = "ig"
             english_response = f"Okay, we will speak in {cleaned}."
             translation_back = spitch_client.text.translate(
                 text=english_response,
