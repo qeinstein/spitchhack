@@ -8,7 +8,10 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from websockets.exceptions import ConnectionClosed
+from dotenv import load_dotenv
 
+
+load_dotenv()
 # ----------------------------
 # Logging Setup
 # ----------------------------
