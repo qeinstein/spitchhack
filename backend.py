@@ -106,7 +106,7 @@ async def audio_ws(ws: WebSocket):
         logger.info(f"Connecting to Spitch WS at {SPITCH_WS_URL}")
         async with websockets.connect(
             SPITCH_WS_URL,
-            extra_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
+            additional_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
         ) as spitch_ws:
             listener_task = asyncio.create_task(spitch_listener(spitch_ws, ws))
             while True:
