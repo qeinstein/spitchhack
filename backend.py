@@ -93,21 +93,37 @@ async def audio_ws(ws: WebSocket):
     session_state.ws = ws
     logger.info("Twilio connected to WebSocket.")
 
+    if not SPITCH_API_KEY:
+        logger.error("SPITCH_API_KEY is not set.")
+        raise ValueError("SPITCH_API_KEY environment variable is missing.")
+
+    spitch_ws = None
+    listener_task = None
     try:
+        logger.info(f"Connecting to Spitch WS at {SPITCH_WS_URL}")
         async with websockets.connect(
             SPITCH_WS_URL,
             extra_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
         ) as spitch_ws:
             listener_task = asyncio.create_task(spitch_listener(spitch_ws, ws))
-
             while True:
                 audio_msg = await ws.receive_bytes()
                 await spitch_ws.send(audio_msg)
 
+    except websockets.exceptions.InvalidStatusCode as e:
+        logger.error(f"Spitch WebSocket connection failed: {e}")
+        raise
     except ConnectionClosed:
         logger.warning("Twilio WebSocket closed.")
     except Exception as e:
         logger.error(f"Audio WS error: {e}")
+        raise
+    finally:
+        if listener_task:
+            listener_task.cancel()
+        if spitch_ws:
+            await spitch_ws.close()
+            logger.info("Spitch WebSocket closed.")
 
 # ----------------------------
 # STEP 4: Spitch Transcription Listener
