@@ -2,14 +2,14 @@ import os
 import json
 import logging
 import asyncio
-import websockets
 import aiohttp
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
-from websockets.exceptions import ConnectionClosed
 from dotenv import load_dotenv
 
+# Import the Spitch SDK
+from spitch import Spitch
 
 load_dotenv()
 # ----------------------------
@@ -23,7 +23,6 @@ logger = logging.getLogger("WagwanAI")
 # ----------------------------
 SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-SPITCH_WS_URL = "wss://api.spitch.io/realtime"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ----------------------------
@@ -40,7 +39,8 @@ class ConversationState:
         self.transcripts = []
         self.last_partial = ""
         self.ai_task = None
-        self.ws = None
+        self.twilio_ws = None
+        self.spitch_client = Spitch()
 
 session_state = ConversationState()
 
@@ -57,7 +57,7 @@ async def voice_response(request: Request):
         method="POST",
         timeout=5
     )
-    gather.say("Welcome to Wagwan AI. , Press 1, for Yoruba. 2, for Igbo. 3, for Hausa. or 4, for English.")
+    gather.say("Welcome to Wagwan AI. Press 1, for Yoruba. 2, for Igbo. 3, for Hausa. or 4, for English.")
     twiml.append(gather)
     twiml.redirect("/voice")
     return Response(content=str(twiml), media_type="application/xml")
@@ -90,80 +90,66 @@ async def select_language(request: Request):
 # STEP 3: WebSocket Audio Bridge
 # ----------------------------
 @app.websocket("/ws-audio")
-async def audio_ws(ws: WebSocket):
+async def audio_ws(twilio_ws: WebSocket):
     """Handles Twilio <-> Spitch real-time streaming."""
-    await ws.accept()
-    session_state.ws = ws
+    await twilio_ws.accept()
+    session_state.twilio_ws = twilio_ws
     logger.info("Twilio connected to WebSocket.")
 
     if not SPITCH_API_KEY:
         logger.error("SPITCH_API_KEY is not set.")
         raise ValueError("SPITCH_API_KEY environment variable is missing.")
-
-    spitch_ws = None
-    listener_task = None
+    
+    # Use the Spitch SDK's real-time method instead of a manual WebSocket connection.
     try:
-        logger.info(f"Connecting to Spitch WS at {SPITCH_WS_URL}")
-        async with websockets.connect(
-            SPITCH_WS_URL,
-            additional_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
-        ) as spitch_ws:
-            listener_task = asyncio.create_task(spitch_listener(spitch_ws, ws))
-            while True:
-                audio_msg = await ws.receive_bytes()
-                await spitch_ws.send(audio_msg)
-
-    except websockets.exceptions.InvalidStatusCode as e:
-        logger.error(f"Spitch WebSocket connection failed: {e}")
-        raise
-    except ConnectionClosed:
-        logger.warning("Twilio WebSocket closed.")
+        await session_state.spitch_client.speech.stream_transcribe(
+            language=session_state.language,
+            on_transcription=handle_spitch_transcription,
+            audio_source=twilio_audio_generator(twilio_ws)
+        )
     except Exception as e:
         logger.error(f"Audio WS error: {e}")
-        raise
     finally:
-        if listener_task:
-            listener_task.cancel()
-        if spitch_ws:
-            await spitch_ws.close()
-            logger.info("Spitch WebSocket closed.")
+        logger.info("Spitch streaming ended.")
 
 # ----------------------------
-# STEP 4: Spitch Transcription Listener
+# Spitch SDK audio source generator
 # ----------------------------
-async def spitch_listener(spitch_ws, twilio_ws):
-    """Listens to Spitch transcriptions and triggers AI replies."""
-    try:
-        async for msg in spitch_ws:
-            data = json.loads(msg)
-
-            # Handle partial transcriptions
-            if data.get("type") == "partial":
-                transcript = data["alternatives"][0]["transcript"]
-                if transcript != session_state.last_partial:
-                    session_state.last_partial = transcript
-                    logger.info(f"Partial: {transcript}")
-
-                    # Stream AI reply ASAP
-                    if not session_state.ai_task:
-                        session_state.ai_task = asyncio.create_task(
-                            stream_ai_reply(transcript, twilio_ws)
-                        )
-
-            # Handle final transcription
-            elif data.get("type") == "final":
-                final_text = data["alternatives"][0]["transcript"]
-                logger.info(f"Final: {final_text}")
-                session_state.transcripts.append(final_text)
-                session_state.ai_task = None  # Reset AI streaming for next utterance
-
-    except Exception as e:
-        logger.error(f"Spitch listener failed: {e}")
+async def twilio_audio_generator(twilio_ws: WebSocket):
+    """Yields audio chunks from the Twilio WebSocket."""
+    while True:
+        try:
+            audio_msg = await twilio_ws.receive_bytes()
+            yield audio_msg
+        except Exception:
+            break
 
 # ----------------------------
-# STEP 5: AI Realtime Streaming
+# Spitch SDK Transcription Callback
 # ----------------------------
-async def stream_ai_reply(prompt: str, twilio_ws):
+async def handle_spitch_transcription(transcription: dict):
+    """Processes real-time transcription from the Spitch SDK."""
+    if transcription.get("type") == "partial":
+        transcript = transcription["alternatives"][0]["transcript"]
+        if transcript != session_state.last_partial:
+            session_state.last_partial = transcript
+            logger.info(f"Partial: {transcript}")
+
+            if not session_state.ai_task:
+                session_state.ai_task = asyncio.create_task(
+                    stream_ai_reply(transcript, session_state.twilio_ws)
+                )
+
+    elif transcription.get("type") == "final":
+        final_text = transcription["alternatives"][0]["transcript"]
+        logger.info(f"Final: {final_text}")
+        session_state.transcripts.append(final_text)
+        session_state.ai_task = None  # Reset AI streaming for the next utterance
+
+# ----------------------------
+# AI Realtime Streaming
+# ----------------------------
+async def stream_ai_reply(prompt: str, twilio_ws: WebSocket):
     """Streams AI response tokens directly to Twilio."""
     try:
         headers = {
@@ -182,7 +168,11 @@ async def stream_ai_reply(prompt: str, twilio_ws):
                 async for chunk in resp.content:
                     if chunk:
                         try:
-                            decoded = json.loads(chunk.decode().replace("data: ", ""))
+                            decoded_chunk = chunk.decode().replace("data: ", "")
+                            if decoded_chunk.strip() == "[DONE]":
+                                continue
+                            
+                            decoded = json.loads(decoded_chunk)
                             token = decoded.get("choices", [{}])[0].get("delta", {}).get("content")
                             if token:
                                 logger.info(f"AI: {token}")
@@ -197,6 +187,228 @@ async def stream_ai_reply(prompt: str, twilio_ws):
 
     except Exception as e:
         logger.error(f"AI streaming failed: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# import os
+# import json
+# import logging
+# import asyncio
+# import websockets
+# import aiohttp
+# from fastapi import FastAPI, Request, WebSocket
+# from fastapi.responses import Response
+# from twilio.twiml.voice_response import VoiceResponse, Gather
+# from websockets.exceptions import ConnectionClosed
+# from dotenv import load_dotenv
+
+
+# load_dotenv()
+# # ----------------------------
+# # Logging Setup
+# # ----------------------------
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger("WagwanAI")
+
+# # ----------------------------
+# # Environment Variables
+# # ----------------------------
+# SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
+# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# SPITCH_WS_URL = "wss://api.spitch.io/realtime"
+# OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# # ----------------------------
+# # FastAPI App
+# # ----------------------------
+# app = FastAPI()
+
+# # ----------------------------
+# # Conversation State
+# # ----------------------------
+# class ConversationState:
+#     def __init__(self):
+#         self.language = "en"
+#         self.transcripts = []
+#         self.last_partial = ""
+#         self.ai_task = None
+#         self.ws = None
+
+# session_state = ConversationState()
+
+# # ----------------------------
+# # STEP 1: Twilio IVR Entry
+# # ----------------------------
+# @app.post("/voice")
+# async def voice_response(request: Request):
+#     """Initial IVR prompt for language selection."""
+#     twiml = VoiceResponse()
+#     gather = Gather(
+#         num_digits=1,
+#         action="/select_language",
+#         method="POST",
+#         timeout=5
+#     )
+#     gather.say("Welcome to Wagwan AI. , Press 1, for Yoruba. 2, for Igbo. 3, for Hausa. or 4, for English.")
+#     twiml.append(gather)
+#     twiml.redirect("/voice")
+#     return Response(content=str(twiml), media_type="application/xml")
+
+# # ----------------------------
+# # STEP 2: Handle Language Selection
+# # ----------------------------
+# @app.post("/select_language")
+# async def select_language(request: Request):
+#     """Handles selected language and begins streaming."""
+#     form = await request.form()
+#     choice = form.get("Digits")
+
+#     lang_map = {
+#         "1": "yo",  # Yoruba
+#         "2": "ig",  # Igbo
+#         "3": "ha",  # Hausa
+#         "4": "en",  # English
+#     }
+#     session_state.language = lang_map.get(choice, "en")
+
+#     twiml = VoiceResponse()
+#     twiml.say(f"Okay. You selected {session_state.language}. You can start speaking.")
+#     start = twiml.start()
+#     start.stream(url="wss://spitchhack.onrender.com/ws-audio")
+#     twiml.pause(length=60)
+#     return Response(content=str(twiml), media_type="application/xml")
+
+# # ----------------------------
+# # STEP 3: WebSocket Audio Bridge
+# # ----------------------------
+# @app.websocket("/ws-audio")
+# async def audio_ws(ws: WebSocket):
+#     """Handles Twilio <-> Spitch real-time streaming."""
+#     await ws.accept()
+#     session_state.ws = ws
+#     logger.info("Twilio connected to WebSocket.")
+
+#     if not SPITCH_API_KEY:
+#         logger.error("SPITCH_API_KEY is not set.")
+#         raise ValueError("SPITCH_API_KEY environment variable is missing.")
+
+#     spitch_ws = None
+#     listener_task = None
+#     try:
+#         logger.info(f"Connecting to Spitch WS at {SPITCH_WS_URL}")
+#         async with websockets.connect(
+#             SPITCH_WS_URL,
+#             additional_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
+#         ) as spitch_ws:
+#             listener_task = asyncio.create_task(spitch_listener(spitch_ws, ws))
+#             while True:
+#                 audio_msg = await ws.receive_bytes()
+#                 await spitch_ws.send(audio_msg)
+
+#     except websockets.exceptions.InvalidStatusCode as e:
+#         logger.error(f"Spitch WebSocket connection failed: {e}")
+#         raise
+#     except ConnectionClosed:
+#         logger.warning("Twilio WebSocket closed.")
+#     except Exception as e:
+#         logger.error(f"Audio WS error: {e}")
+#         raise
+#     finally:
+#         if listener_task:
+#             listener_task.cancel()
+#         if spitch_ws:
+#             await spitch_ws.close()
+#             logger.info("Spitch WebSocket closed.")
+
+# # ----------------------------
+# # STEP 4: Spitch Transcription Listener
+# # ----------------------------
+# async def spitch_listener(spitch_ws, twilio_ws):
+#     """Listens to Spitch transcriptions and triggers AI replies."""
+#     try:
+#         async for msg in spitch_ws:
+#             data = json.loads(msg)
+
+#             # Handle partial transcriptions
+#             if data.get("type") == "partial":
+#                 transcript = data["alternatives"][0]["transcript"]
+#                 if transcript != session_state.last_partial:
+#                     session_state.last_partial = transcript
+#                     logger.info(f"Partial: {transcript}")
+
+#                     # Stream AI reply ASAP
+#                     if not session_state.ai_task:
+#                         session_state.ai_task = asyncio.create_task(
+#                             stream_ai_reply(transcript, twilio_ws)
+#                         )
+
+#             # Handle final transcription
+#             elif data.get("type") == "final":
+#                 final_text = data["alternatives"][0]["transcript"]
+#                 logger.info(f"Final: {final_text}")
+#                 session_state.transcripts.append(final_text)
+#                 session_state.ai_task = None  # Reset AI streaming for next utterance
+
+#     except Exception as e:
+#         logger.error(f"Spitch listener failed: {e}")
+
+# # ----------------------------
+# # STEP 5: AI Realtime Streaming
+# # ----------------------------
+# async def stream_ai_reply(prompt: str, twilio_ws):
+#     """Streams AI response tokens directly to Twilio."""
+#     try:
+#         headers = {
+#             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+#             "Content-Type": "application/json",
+#         }
+
+#         payload = {
+#             "model": "mistralai/mistral-7b-instruct:free",
+#             "stream": True,
+#             "messages": [{"role": "user", "content": prompt}],
+#         }
+
+#         async with aiohttp.ClientSession() as session:
+#             async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as resp:
+#                 async for chunk in resp.content:
+#                     if chunk:
+#                         try:
+#                             decoded = json.loads(chunk.decode().replace("data: ", ""))
+#                             token = decoded.get("choices", [{}])[0].get("delta", {}).get("content")
+#                             if token:
+#                                 logger.info(f"AI: {token}")
+
+#                                 # Send streaming token to Twilio TTS
+#                                 await twilio_ws.send_text(json.dumps({
+#                                     "event": "media",
+#                                     "media": {"text": token}
+#                                 }))
+#                         except Exception:
+#                             continue
+
+#     except Exception as e:
+#         logger.error(f"AI streaming failed: {e}")
 
 
 
