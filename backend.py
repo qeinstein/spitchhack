@@ -1,37 +1,48 @@
 import os
-import uuid
 import logging
 from typing import Dict, Any
-
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import Response
-from twilio.twiml.voice_response import VoiceResponse, Start
+from twilio.twiml.voice_response import VoiceResponse, Start, Stream
+from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
-
 from spitch import Spitch
-from openai import OpenAI  # via OpenRouter
-
-load_dotenv()
+from openai import OpenAI
 
 # ---- Config ----
+load_dotenv()
+
+# Validate environment variables
+required_vars = [
+    "SPITCH_API_KEY",
+    "OPENROUTER_API_KEY",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "BASE_URL",
+    "CONVERSATION_SERVICE_SID"
+]
+for var in required_vars:
+    if not os.getenv(var):
+        raise RuntimeError(f"Missing environment variable: {var}")
+
 SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
-if not BASE_URL:
-    raise RuntimeError("BASE_URL must be set (public HTTPS URL)")
-
 # ---- Clients ----
-spitch_client = Spitch(api_key=SPITCH_API_KEY)
-openrouter_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+try:
+    spitch_client = Spitch(api_key=SPITCH_API_KEY)
+    openrouter_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize clients: {e}")
 
 # ---- App setup ----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("conversation-relay")
 app = FastAPI()
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 
 # ---- Language map ----
 LANGUAGE_MAP = {
@@ -41,23 +52,42 @@ LANGUAGE_MAP = {
     "4": ("English", "en")
 }
 
-LANGUAGE_SELECTION: Dict[str, str] = {}   # CallSid -> lang code
+LANGUAGE_SELECTION: Dict[str, str] = {}  # CallSid -> lang code
 
 # ---- Helpers ----
 def spitch_translate(text: str, source: str, target: str) -> str:
-    resp = spitch_client.text.translate(text=text, source=source, target=target)
-    t = getattr(resp, "text", None)
-    if not t:
-        raise RuntimeError("Empty translation from Spitch")
-    return t
+    try:
+        resp = spitch_client.text.translate(text=text, source=source, target=target)
+        t = getattr(resp, "text", None)
+        if not t:
+            raise RuntimeError("Empty translation from Spitch")
+        return t
+    except Exception as e:
+        logger.error(f"Spitch translation failed: {e}")
+        raise RuntimeError(f"Translation error: {e}")
 
 def openrouter_chat_reply(messages: list) -> str:
-    resp = openrouter_client.chat.completions.create(model=MODEL, messages=messages)
-    return resp.choices[0].message.content
+    try:
+        resp = openrouter_client.chat.completions.create(model=MODEL, messages=messages)
+        return resp.choices[0].message.content
+    except Exception as e:
+        logger.error(f"OpenRouter API error: {e}")
+        return "Sorry, I couldn't process your request. Please try again."
+
+# ---- Root endpoint ----
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the SpitchHack Voice Relay API. Use /health to check status."}
 
 # ---- TwiML entry ----
 @app.post("/voice")
-async def voice_entry():
+async def voice_entry(request: Request):
+    # Validate Twilio webhook
+    body = await request.body()
+    form_data = await request.form()
+    if not twilio_validator.validate(str(request.url), dict(form_data), request.headers.get("X-Twilio-Signature", "")):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
     twiml = VoiceResponse()
     gather = twiml.gather(
         num_digits=1,
@@ -71,11 +101,16 @@ async def voice_entry():
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_language")
-async def process_language(Digits: str = Form(None), CallSid: str = Form(None)):
-    twiml = VoiceResponse()
+async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
+    # Validate Twilio webhook
+    body = await request.body()
+    form_data = await request.form()
+    if not twilio_validator.validate(str(request.url), dict(form_data), request.headers.get("X-Twilio-Signature", "")):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    if not Digits or Digits not in LANGUAGE_MAP:
-        twiml.say("Invalid selection. Please try again.")
+    twiml = VoiceResponse()
+    if not Digits or Digits not in LANGUAGE_MAP or not CallSid:
+        twiml.say("Invalid selection or call ID. Please try again.")
         twiml.redirect("/voice")
         return Response(content=str(twiml), media_type="application/xml")
 
@@ -84,10 +119,9 @@ async def process_language(Digits: str = Form(None), CallSid: str = Form(None)):
     logger.info("Language set for CallSid %s -> %s", CallSid, lang_code)
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
-
-    # Start Conversation Relay
     start = Start()
-    start.conversation(service_sid=os.getenv("CONVERSATION_SERVICE_SID"))
+    stream = Stream(url=f"wss://{BASE_URL.lstrip('https://')}/relay")
+    start.append(stream)
     twiml.append(start)
 
     return Response(content=str(twiml), media_type="application/xml")
@@ -95,49 +129,144 @@ async def process_language(Digits: str = Form(None), CallSid: str = Form(None)):
 # ---- Conversation Relay webhook ----
 @app.post("/relay")
 async def relay_handler(request: Request):
-    event = await request.json()
-    logger.info("Relay event: %s", event)
+    # Validate Twilio webhook
+    body = await request.body()
+    form_data = await request.form()
+    if not twilio_validator.validate(str(request.url), dict(form_data), request.headers.get("X-Twilio-Signature", "")):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
+    try:
+        event = await request.json()
+    except Exception as e:
+        logger.error(f"Invalid JSON in relay event: {e}")
+        return {"type": "noop"}
+
+    logger.info("Relay event: %s", event)
     event_type = event.get("type")
     call_sid = event.get("callSid")
+    if not call_sid:
+        logger.error("Missing callSid in event")
+        return {"type": "noop"}
+
+    # Clean up LANGUAGE_SELECTION on call end
+    if event_type == "call_ended":
+        LANGUAGE_SELECTION.pop(call_sid, None)
+        logger.info("Cleaned up LANGUAGE_SELECTION for CallSid %s", call_sid)
+        return {"type": "noop"}
+
     lang = LANGUAGE_SELECTION.get(call_sid, "en")
 
     # Handle user utterances
     if event_type == "utterance":
-        user_text = event["text"]
+        user_text = event.get("text")
+        if not user_text:
+            logger.error("Missing text in utterance event")
+            return {"type": "noop"}
 
-        # Translate into English if needed
-        if lang != "en":
-            english_text = spitch_translate(user_text, source=lang, target="en")
-        else:
-            english_text = user_text
+        # Check for repetitive transcription
+        if user_text.count("I don't know") > 10 or user_text.count("thank you") > 10:
+            logger.warning("Repetitive transcription detected, ignoring: %s", user_text)
+            return {"type": "noop"}
 
-        # Get assistant reply
-        reply_en = openrouter_chat_reply([
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": english_text}
-        ])
+        try:
+            # Translate into English if needed
+            if lang != "en":
+                english_text = spitch_translate(user_text, source=lang, target="en")
+            else:
+                english_text = user_text
 
-        # Translate back to local language if needed
-        if lang != "en":
-            reply_local = spitch_translate(reply_en, source="en", target=lang)
-        else:
-            reply_local = reply_en
+            # Get assistant reply
+            reply_en = openrouter_chat_reply([
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": english_text}
+            ])
 
-        return {
-            "type": "reply",
-            "text": reply_local
-        }
+            # Translate back to local language if needed
+            if lang != "en":
+                reply_local = spitch_translate(reply_en, source="en", target=lang)
+            else:
+                reply_local = reply_en
 
-    # For other events (participant_joined, etc.)
+            return {
+                "type": "reply",
+                "text": reply_local
+            }
+        except Exception as e:
+            logger.error(f"Error processing utterance: {e}")
+            return {"type": "reply", "text": "Sorry, an error occurred. Please try again."}
+
     return {"type": "noop"}
 
 # ---- Health check ----
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    status = {"status": "ok", "services": {}}
+    try:
+        spitch_client.text.translate("test", "en", "en")
+        status["services"]["spitch"] = "ok"
+    except Exception:
+        status["services"]["spitch"] = "down"
+    try:
+        openrouter_client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": "test"}])
+        status["services"]["openrouter"] = "ok"
+    except Exception:
+        status["services"]["openrouter"] = "down"
+    return status
 
-
+# Note: If WebSocket is required for /relay, replace the above @app.post("/relay") with:
+# from fastapi import WebSocket
+# @app.websocket("/relay")
+# async def relay_websocket(websocket: WebSocket):
+#     await websocket.accept()
+#     try:
+#         while True:
+#             data = await websocket.receive_json()
+#             logger.info("WebSocket event: %s", data)
+#             event_type = data.get("type")
+#             call_sid = data.get("callSid")
+#             if not call_sid:
+#                 logger.error("Missing callSid in event")
+#                 await websocket.send_json({"type": "noop"})
+#                 continue
+#             if event_type == "call_ended":
+#                 LANGUAGE_SELECTION.pop(call_sid, None)
+#                 logger.info("Cleaned up LANGUAGE_SELECTION for CallSid %s", call_sid)
+#                 await websocket.send_json({"type": "noop"})
+#                 continue
+#             lang = LANGUAGE_SELECTION.get(call_sid, "en")
+#             if event_type == "utterance":
+#                 user_text = data.get("text")
+#                 if not user_text:
+#                     logger.error("Missing text in utterance event")
+#                     await websocket.send_json({"type": "noop"})
+#                     continue
+#                 if user_text.count("I don't know") > 10 or user_text.count("thank you") > 10:
+#                     logger.warning("Repetitive transcription detected, ignoring: %s", user_text)
+#                     await websocket.send_json({"type": "noop"})
+#                     continue
+#                 try:
+#                     if lang != "en":
+#                         english_text = spitch_translate(user_text, source=lang, target="en")
+#                     else:
+#                         english_text = user_text
+#                     reply_en = openrouter_chat_reply([
+#                         {"role": "system", "content": "You are a helpful assistant."},
+#                         {"role": "user", "content": english_text}
+#                     ])
+#                     if lang != "en":
+#                         reply_local = spitch_translate(reply_en, source="en", target=lang)
+#                     else:
+#                         reply_local = reply_en
+#                     await websocket.send_json({"type": "reply", "text": reply_local})
+#                 except Exception as e:
+#                     logger.error(f"Error processing utterance: {e}")
+#                     await websocket.send_json({"type": "reply", "text": "Sorry, an error occurred. Please try again."})
+#             else:
+#                 await websocket.send_json({"type": "noop"})
+#     except Exception as e:
+#         logger.error("WebSocket error: %s", e)
+#     finally:
+#         await websocket.close()
 
 
 
