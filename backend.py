@@ -8,6 +8,7 @@ from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
 from spitch import Spitch
 from openai import OpenAI
+from urllib.parse import urlparse
 
 # ---- Config ----
 load_dotenv()
@@ -56,6 +57,9 @@ LANGUAGE_SELECTION: Dict[str, str] = {}  # CallSid -> lang code
 
 # ---- Helpers ----
 def spitch_translate(text: str, source: str, target: str) -> str:
+    """
+    Translate `text` from `source` language to `target` using Spitch API.
+    """
     try:
         resp = spitch_client.text.translate(text=text, source=source, target=target)
         t = getattr(resp, "text", None)
@@ -83,12 +87,14 @@ async def root():
 @app.post("/voice")
 async def voice_entry(request: Request):
     # Validate Twilio webhook
-    body = await request.body()
     form_data = await request.form()
-    if not twilio_validator.validate(str(request.url), dict(form_data), request.headers.get("X-Twilio-Signature", "")):
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = str(request.url)
+    if not twilio_validator.validate(url, dict(form_data), signature):
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     twiml = VoiceResponse()
+    # Gather language selection
     gather = twiml.gather(
         num_digits=1,
         action="/process_language",
@@ -96,20 +102,29 @@ async def voice_entry(request: Request):
         timeout=8
     )
     gather.say("Welcome to Proxy. For Yoruba press 1. For Igbo press 2. For Hausa press 3. For English press 4.")
-    twiml.say("Sorry, we did not receive input.")
+    # If gather doesn't get input:
+    twiml.redirect("/process_language_fallback")
+
+    return Response(content=str(twiml), media_type="application/xml")
+
+@app.post("/process_language_fallback")
+async def process_language_fallback(request: Request):
+    twiml = VoiceResponse()
+    twiml.say("Sorry, we did not receive input. Redirecting you back to language selection.")
     twiml.redirect("/voice")
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_language")
 async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
     # Validate Twilio webhook
-    body = await request.body()
     form_data = await request.form()
-    if not twilio_validator.validate(str(request.url), dict(form_data), request.headers.get("X-Twilio-Signature", "")):
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = str(request.url)
+    if not twilio_validator.validate(url, dict(form_data), signature):
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     twiml = VoiceResponse()
-    if not Digits or Digits not in LANGUAGE_MAP or not CallSid:
+    if not (Digits and CallSid and Digits in LANGUAGE_MAP):
         twiml.say("Invalid selection or call ID. Please try again.")
         twiml.redirect("/voice")
         return Response(content=str(twiml), media_type="application/xml")
@@ -119,580 +134,102 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
     logger.info("Language set for CallSid %s -> %s", CallSid, lang_code)
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
+
+    # Fixing BASE_URL parsing
+    parsed = urlparse(BASE_URL)
+    host = parsed.netloc or parsed.path  # in case BASE_URL had no scheme
+    # Use websocket URL derived from BASE_URL
+    ws_url = f"wss://{host}/relay"
+
     start = Start()
-    stream = Stream(url=f"wss://{BASE_URL.lstrip('https://')}/relay")
+    stream = Stream(url=ws_url)
     start.append(stream)
     twiml.append(start)
 
     return Response(content=str(twiml), media_type="application/xml")
 
-# ---- Conversation Relay webhook ----
-@app.post("/relay")
-async def relay_handler(request: Request):
-    # Validate Twilio webhook
-    body = await request.body()
-    form_data = await request.form()
-    if not twilio_validator.validate(str(request.url), dict(form_data), request.headers.get("X-Twilio-Signature", "")):
-        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
-
-    try:
-        event = await request.json()
-    except Exception as e:
-        logger.error(f"Invalid JSON in relay event: {e}")
-        return {"type": "noop"}
-
-    logger.info("Relay event: %s", event)
-    event_type = event.get("type")
-    call_sid = event.get("callSid")
-    if not call_sid:
-        logger.error("Missing callSid in event")
-        return {"type": "noop"}
-
-    # Clean up LANGUAGE_SELECTION on call end
-    if event_type == "call_ended":
-        LANGUAGE_SELECTION.pop(call_sid, None)
-        logger.info("Cleaned up LANGUAGE_SELECTION for CallSid %s", call_sid)
-        return {"type": "noop"}
-
-    lang = LANGUAGE_SELECTION.get(call_sid, "en")
-
-    # Handle user utterances
-    if event_type == "utterance":
-        user_text = event.get("text")
-        if not user_text:
-            logger.error("Missing text in utterance event")
-            return {"type": "noop"}
-
-        # Check for repetitive transcription
-        if user_text.count("I don't know") > 10 or user_text.count("thank you") > 10:
-            logger.warning("Repetitive transcription detected, ignoring: %s", user_text)
-            return {"type": "noop"}
-
-        try:
-            # Translate into English if needed
-            if lang != "en":
-                english_text = spitch_translate(user_text, source=lang, target="en")
-            else:
-                english_text = user_text
-
-            # Get assistant reply
-            reply_en = openrouter_chat_reply([
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": english_text}
-            ])
-
-            # Translate back to local language if needed
-            if lang != "en":
-                reply_local = spitch_translate(reply_en, source="en", target=lang)
-            else:
-                reply_local = reply_en
-
-            return {
-                "type": "reply",
-                "text": reply_local
-            }
-        except Exception as e:
-            logger.error(f"Error processing utterance: {e}")
-            return {"type": "reply", "text": "Sorry, an error occurred. Please try again."}
-
-    return {"type": "noop"}
 
 # ---- Health check ----
 @app.get("/health")
 async def health():
     status = {"status": "ok", "services": {}}
+    # Test Spitch translate
     try:
-        spitch_client.text.translate("test", "en", "en")
+        _ = spitch_translate("test", "en", "en")
         status["services"]["spitch"] = "ok"
-    except Exception:
-        status["services"]["spitch"] = "down"
+    except Exception as e:
+        status["services"]["spitch"] = f"down: {e}"
+    # Test OpenRouter
     try:
-        openrouter_client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": "test"}])
+        _ = openrouter_client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": "test"}])
         status["services"]["openrouter"] = "ok"
-    except Exception:
-        status["services"]["openrouter"] = "down"
+    except Exception as e:
+        status["services"]["openrouter"] = f"down: {e}"
     return status
 
-# Note: If WebSocket is required for /relay, replace the above @app.post("/relay") with:
-# from fastapi import WebSocket
-# @app.websocket("/relay")
-# async def relay_websocket(websocket: WebSocket):
-#     await websocket.accept()
-#     try:
-#         while True:
-#             data = await websocket.receive_json()
-#             logger.info("WebSocket event: %s", data)
-#             event_type = data.get("type")
-#             call_sid = data.get("callSid")
-#             if not call_sid:
-#                 logger.error("Missing callSid in event")
-#                 await websocket.send_json({"type": "noop"})
-#                 continue
-#             if event_type == "call_ended":
-#                 LANGUAGE_SELECTION.pop(call_sid, None)
-#                 logger.info("Cleaned up LANGUAGE_SELECTION for CallSid %s", call_sid)
-#                 await websocket.send_json({"type": "noop"})
-#                 continue
-#             lang = LANGUAGE_SELECTION.get(call_sid, "en")
-#             if event_type == "utterance":
-#                 user_text = data.get("text")
-#                 if not user_text:
-#                     logger.error("Missing text in utterance event")
-#                     await websocket.send_json({"type": "noop"})
-#                     continue
-#                 if user_text.count("I don't know") > 10 or user_text.count("thank you") > 10:
-#                     logger.warning("Repetitive transcription detected, ignoring: %s", user_text)
-#                     await websocket.send_json({"type": "noop"})
-#                     continue
-#                 try:
-#                     if lang != "en":
-#                         english_text = spitch_translate(user_text, source=lang, target="en")
-#                     else:
-#                         english_text = user_text
-#                     reply_en = openrouter_chat_reply([
-#                         {"role": "system", "content": "You are a helpful assistant."},
-#                         {"role": "user", "content": english_text}
-#                     ])
-#                     if lang != "en":
-#                         reply_local = spitch_translate(reply_en, source="en", target=lang)
-#                     else:
-#                         reply_local = reply_en
-#                     await websocket.send_json({"type": "reply", "text": reply_local})
-#                 except Exception as e:
-#                     logger.error(f"Error processing utterance: {e}")
-#                     await websocket.send_json({"type": "reply", "text": "Sorry, an error occurred. Please try again."})
-#             else:
-#                 await websocket.send_json({"type": "noop"})
-#     except Exception as e:
-#         logger.error("WebSocket error: %s", e)
-#     finally:
-#         await websocket.close()
-
-
-
-
-
-
-
-
-
-
-# import os
-# import json
-# import logging
-# import asyncio
-# import aiohttp
-# from fastapi import FastAPI, Request, WebSocket
-# from fastapi.responses import Response
-# from twilio.twiml.voice_response import VoiceResponse, Gather
-# from dotenv import load_dotenv
-
-# # Import the Spitch SDK
-# from spitch import Spitch
-
-# load_dotenv()
-# # ----------------------------
-# # Logging Setup
-# # ----------------------------
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger("WagwanAI")
-
-# # ----------------------------
-# # Environment Variables
-# # ----------------------------
-# SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
-# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# # ----------------------------
-# # FastAPI App
-# # ----------------------------
-# app = FastAPI()
-
-# # ----------------------------
-# # Conversation State
-# # ----------------------------
-# class ConversationState:
-#     def __init__(self):
-#         self.language = "en"
-#         self.transcripts = []
-#         self.last_partial = ""
-#         self.ai_task = None
-#         self.twilio_ws = None
-#         self.spitch_client = Spitch()
-
-# session_state = ConversationState()
-
-# # ----------------------------
-# # STEP 1: Twilio IVR Entry
-# # ----------------------------
-# @app.post("/voice")
-# async def voice_response(request: Request):
-#     """Initial IVR prompt for language selection."""
-#     twiml = VoiceResponse()
-#     gather = Gather(
-#         num_digits=1,
-#         action="/select_language",
-#         method="POST",
-#         timeout=5
-#     )
-#     gather.say("Welcome to Wagwan AI. Press 1, for Yoruba. 2, for Igbo. 3, for Hausa. or 4, for English.")
-#     twiml.append(gather)
-#     twiml.redirect("/voice")
-#     return Response(content=str(twiml), media_type="application/xml")
-
-# # ----------------------------
-# # STEP 2: Handle Language Selection
-# # ----------------------------
-# @app.post("/select_language")
-# async def select_language(request: Request):
-#     """Handles selected language and begins streaming."""
-#     form = await request.form()
-#     choice = form.get("Digits")
-
-#     lang_map = {
-#         "1": "yo",  # Yoruba
-#         "2": "ig",  # Igbo
-#         "3": "ha",  # Hausa
-#         "4": "en",  # English
-#     }
-#     session_state.language = lang_map.get(choice, "en")
-
-#     twiml = VoiceResponse()
-#     twiml.say(f"Okay. You selected {session_state.language}. You can start speaking.")
-#     start = twiml.start()
-#     start.stream(url="wss://spitchhack.onrender.com/ws-audio")
-#     twiml.pause(length=60)
-#     return Response(content=str(twiml), media_type="application/xml")
-
-# # ----------------------------
-# # STEP 3: WebSocket Audio Bridge
-# # ----------------------------
-# @app.websocket("/ws-audio")
-# async def audio_ws(twilio_ws: WebSocket):
-#     """Handles Twilio <-> Spitch real-time streaming."""
-#     await twilio_ws.accept()
-#     session_state.twilio_ws = twilio_ws
-#     logger.info("Twilio connected to WebSocket.")
-
-#     if not SPITCH_API_KEY:
-#         logger.error("SPITCH_API_KEY is not set.")
-#         raise ValueError("SPITCH_API_KEY environment variable is missing.")
-    
-#     # Use the Spitch SDK's real-time method instead of a manual WebSocket connection.
-#     try:
-#         await session_state.spitch_client.speech.stream_transcribe(
-#             language=session_state.language,
-#             on_transcription=handle_spitch_transcription,
-#             audio_source=twilio_audio_generator(twilio_ws)
-#         )
-#     except Exception as e:
-#         logger.error(f"Audio WS error: {e}")
-#     finally:
-#         logger.info("Spitch streaming ended.")
-
-# # ----------------------------
-# # Spitch SDK audio source generator
-# # ----------------------------
-# async def twilio_audio_generator(twilio_ws: WebSocket):
-#     """Yields audio chunks from the Twilio WebSocket."""
-#     while True:
-#         try:
-#             audio_msg = await twilio_ws.receive_bytes()
-#             yield audio_msg
-#         except Exception:
-#             break
-
-# # ----------------------------
-# # Spitch SDK Transcription Callback
-# # ----------------------------
-# async def handle_spitch_transcription(transcription: dict):
-#     """Processes real-time transcription from the Spitch SDK."""
-#     if transcription.get("type") == "partial":
-#         transcript = transcription["alternatives"][0]["transcript"]
-#         if transcript != session_state.last_partial:
-#             session_state.last_partial = transcript
-#             logger.info(f"Partial: {transcript}")
-
-#             if not session_state.ai_task:
-#                 session_state.ai_task = asyncio.create_task(
-#                     stream_ai_reply(transcript, session_state.twilio_ws)
-#                 )
-
-#     elif transcription.get("type") == "final":
-#         final_text = transcription["alternatives"][0]["transcript"]
-#         logger.info(f"Final: {final_text}")
-#         session_state.transcripts.append(final_text)
-#         session_state.ai_task = None  # Reset AI streaming for the next utterance
-
-# # ----------------------------
-# # AI Realtime Streaming
-# # ----------------------------
-# async def stream_ai_reply(prompt: str, twilio_ws: WebSocket):
-#     """Streams AI response tokens directly to Twilio."""
-#     try:
-#         headers = {
-#             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-#             "Content-Type": "application/json",
-#         }
-
-#         payload = {
-#             "model": "mistralai/mistral-7b-instruct:free",
-#             "stream": True,
-#             "messages": [{"role": "user", "content": prompt}],
-#         }
-
-#         async with aiohttp.ClientSession() as session:
-#             async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as resp:
-#                 async for chunk in resp.content:
-#                     if chunk:
-#                         try:
-#                             decoded_chunk = chunk.decode().replace("data: ", "")
-#                             if decoded_chunk.strip() == "[DONE]":
-#                                 continue
-                            
-#                             decoded = json.loads(decoded_chunk)
-#                             token = decoded.get("choices", [{}])[0].get("delta", {}).get("content")
-#                             if token:
-#                                 logger.info(f"AI: {token}")
-
-#                                 # Send streaming token to Twilio TTS
-#                                 await twilio_ws.send_text(json.dumps({
-#                                     "event": "media",
-#                                     "media": {"text": token}
-#                                 }))
-#                         except Exception:
-#                             continue
-
-#     except Exception as e:
-#         logger.error(f"AI streaming failed: {e}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import os
-# import json
-# import logging
-# import asyncio
-# import websockets
-# import aiohttp
-# from fastapi import FastAPI, Request, WebSocket
-# from fastapi.responses import Response
-# from twilio.twiml.voice_response import VoiceResponse, Gather
-# from websockets.exceptions import ConnectionClosed
-# from dotenv import load_dotenv
-
-
-# load_dotenv()
-# # ----------------------------
-# # Logging Setup
-# # ----------------------------
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger("WagwanAI")
-
-# # ----------------------------
-# # Environment Variables
-# # ----------------------------
-# SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
-# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# SPITCH_WS_URL = "wss://api.spitch.io/realtime"
-# OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# # ----------------------------
-# # FastAPI App
-# # ----------------------------
-# app = FastAPI()
-
-# # ----------------------------
-# # Conversation State
-# # ----------------------------
-# class ConversationState:
-#     def __init__(self):
-#         self.language = "en"
-#         self.transcripts = []
-#         self.last_partial = ""
-#         self.ai_task = None
-#         self.ws = None
-
-# session_state = ConversationState()
-
-# # ----------------------------
-# # STEP 1: Twilio IVR Entry
-# # ----------------------------
-# @app.post("/voice")
-# async def voice_response(request: Request):
-#     """Initial IVR prompt for language selection."""
-#     twiml = VoiceResponse()
-#     gather = Gather(
-#         num_digits=1,
-#         action="/select_language",
-#         method="POST",
-#         timeout=5
-#     )
-#     gather.say("Welcome to Wagwan AI. , Press 1, for Yoruba. 2, for Igbo. 3, for Hausa. or 4, for English.")
-#     twiml.append(gather)
-#     twiml.redirect("/voice")
-#     return Response(content=str(twiml), media_type="application/xml")
-
-# # ----------------------------
-# # STEP 2: Handle Language Selection
-# # ----------------------------
-# @app.post("/select_language")
-# async def select_language(request: Request):
-#     """Handles selected language and begins streaming."""
-#     form = await request.form()
-#     choice = form.get("Digits")
-
-#     lang_map = {
-#         "1": "yo",  # Yoruba
-#         "2": "ig",  # Igbo
-#         "3": "ha",  # Hausa
-#         "4": "en",  # English
-#     }
-#     session_state.language = lang_map.get(choice, "en")
-
-#     twiml = VoiceResponse()
-#     twiml.say(f"Okay. You selected {session_state.language}. You can start speaking.")
-#     start = twiml.start()
-#     start.stream(url="wss://spitchhack.onrender.com/ws-audio")
-#     twiml.pause(length=60)
-#     return Response(content=str(twiml), media_type="application/xml")
-
-# # ----------------------------
-# # STEP 3: WebSocket Audio Bridge
-# # ----------------------------
-# @app.websocket("/ws-audio")
-# async def audio_ws(ws: WebSocket):
-#     """Handles Twilio <-> Spitch real-time streaming."""
-#     await ws.accept()
-#     session_state.ws = ws
-#     logger.info("Twilio connected to WebSocket.")
-
-#     if not SPITCH_API_KEY:
-#         logger.error("SPITCH_API_KEY is not set.")
-#         raise ValueError("SPITCH_API_KEY environment variable is missing.")
-
-#     spitch_ws = None
-#     listener_task = None
-#     try:
-#         logger.info(f"Connecting to Spitch WS at {SPITCH_WS_URL}")
-#         async with websockets.connect(
-#             SPITCH_WS_URL,
-#             additional_headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}
-#         ) as spitch_ws:
-#             listener_task = asyncio.create_task(spitch_listener(spitch_ws, ws))
-#             while True:
-#                 audio_msg = await ws.receive_bytes()
-#                 await spitch_ws.send(audio_msg)
-
-#     except websockets.exceptions.InvalidStatusCode as e:
-#         logger.error(f"Spitch WebSocket connection failed: {e}")
-#         raise
-#     except ConnectionClosed:
-#         logger.warning("Twilio WebSocket closed.")
-#     except Exception as e:
-#         logger.error(f"Audio WS error: {e}")
-#         raise
-#     finally:
-#         if listener_task:
-#             listener_task.cancel()
-#         if spitch_ws:
-#             await spitch_ws.close()
-#             logger.info("Spitch WebSocket closed.")
-
-# # ----------------------------
-# # STEP 4: Spitch Transcription Listener
-# # ----------------------------
-# async def spitch_listener(spitch_ws, twilio_ws):
-#     """Listens to Spitch transcriptions and triggers AI replies."""
-#     try:
-#         async for msg in spitch_ws:
-#             data = json.loads(msg)
-
-#             # Handle partial transcriptions
-#             if data.get("type") == "partial":
-#                 transcript = data["alternatives"][0]["transcript"]
-#                 if transcript != session_state.last_partial:
-#                     session_state.last_partial = transcript
-#                     logger.info(f"Partial: {transcript}")
-
-#                     # Stream AI reply ASAP
-#                     if not session_state.ai_task:
-#                         session_state.ai_task = asyncio.create_task(
-#                             stream_ai_reply(transcript, twilio_ws)
-#                         )
-
-#             # Handle final transcription
-#             elif data.get("type") == "final":
-#                 final_text = data["alternatives"][0]["transcript"]
-#                 logger.info(f"Final: {final_text}")
-#                 session_state.transcripts.append(final_text)
-#                 session_state.ai_task = None  # Reset AI streaming for next utterance
-
-#     except Exception as e:
-#         logger.error(f"Spitch listener failed: {e}")
-
-# # ----------------------------
-# # STEP 5: AI Realtime Streaming
-# # ----------------------------
-# async def stream_ai_reply(prompt: str, twilio_ws):
-#     """Streams AI response tokens directly to Twilio."""
-#     try:
-#         headers = {
-#             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-#             "Content-Type": "application/json",
-#         }
-
-#         payload = {
-#             "model": "mistralai/mistral-7b-instruct:free",
-#             "stream": True,
-#             "messages": [{"role": "user", "content": prompt}],
-#         }
-
-#         async with aiohttp.ClientSession() as session:
-#             async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as resp:
-#                 async for chunk in resp.content:
-#                     if chunk:
-#                         try:
-#                             decoded = json.loads(chunk.decode().replace("data: ", ""))
-#                             token = decoded.get("choices", [{}])[0].get("delta", {}).get("content")
-#                             if token:
-#                                 logger.info(f"AI: {token}")
-
-#                                 # Send streaming token to Twilio TTS
-#                                 await twilio_ws.send_text(json.dumps({
-#                                     "event": "media",
-#                                     "media": {"text": token}
-#                                 }))
-#                         except Exception:
-#                             continue
-
-#     except Exception as e:
-#         logger.error(f"AI streaming failed: {e}")
-
-
-
-
-
+from fastapi import WebSocket
+
+@app.websocket("/relay")
+async def relay_websocket(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_json()
+            logger.debug("WebSocket event: %s", data)
+            event_type = data.get("type")
+            call_sid = data.get("callSid")
+            if not call_sid:
+                logger.error("Missing callSid in event")
+                await websocket.send_json({"type": "noop"})
+                continue
+
+            if event_type == "call_ended":
+                LANGUAGE_SELECTION.pop(call_sid, None)
+                logger.info("Cleaned up LANGUAGE_SELECTION for CallSid %s", call_sid)
+                await websocket.send_json({"type": "noop"})
+                continue
+
+            if event_type == "utterance":
+                user_text = data.get("text")
+                if not user_text or not user_text.strip():
+                    logger.error("Missing or empty text in utterance event")
+                    await websocket.send_json({"type": "noop"})
+                    continue
+
+                # Optionally, filter overly repetitive or irrelevant utterances
+                # Could track repeat counts per call_sid if needed
+
+                lang = LANGUAGE_SELECTION.get(call_sid, "en")
+
+                try:
+                    if lang != "en":
+                        english_text = spitch_translate(user_text, source=lang, target="en")
+                    else:
+                        english_text = user_text
+
+                    reply_en = openrouter_chat_reply([
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": english_text}
+                    ])
+
+                    if lang != "en":
+                        reply_local = spitch_translate(reply_en, source="en", target=lang)
+                    else:
+                        reply_local = reply_en
+
+                    await websocket.send_json({"type": "reply", "text": reply_local})
+
+                except Exception as e:
+                    logger.error(f"Error processing utterance: {e}")
+                    await websocket.send_json({"type": "reply", "text": "Sorry, an error occurred. Please try again."})
+
+            else:
+                await websocket.send_json({"type": "noop"})
+
+    except Exception as e:
+        logger.error("WebSocket error: %s", e)
+    finally:
+        await websocket.close()
 
 
 
@@ -1234,305 +771,3 @@ async def health():
 # async def health():
 #     return {"status": "ok"}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from fastapi import FastAPI, UploadFile, Form, HTTPException
-# from fastapi.responses import Response
-# from fastapi.staticfiles import StaticFiles
-# import io
-# import os
-# import base64
-# import uuid
-# import tempfile
-# import glob
-# import time
-# import re
-# from spitch import Spitch
-# from openai import OpenAI
-# from dotenv import load_dotenv
-# from twilio.twiml.voice_response import VoiceResponse, Gather
-# import requests
-# import logging
-
-# # Set up logging
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger(__name__)
-
-# app = FastAPI()
-
-# # Ensure static directory exists
-# STATIC_DIR = "static"
-# try:
-#     os.makedirs(STATIC_DIR, exist_ok=True)
-#     logger.info(f"Created static directory: {STATIC_DIR}")
-# except Exception as e:
-#     logger.error(f"Failed to create static directory: {e}")
-#     raise RuntimeError(f"Cannot create static directory: {e}")
-
-# # Mount static directory
-# if os.path.exists(STATIC_DIR):
-#     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-# else:
-#     logger.error(f"Static directory {STATIC_DIR} does not exist")
-#     raise RuntimeError(f"Cannot mount static directory: {STATIC_DIR}")
-
-# load_dotenv()
-# try:
-#     spitch_client = Spitch(api_key=os.getenv("SPITCH_API_KEY"))
-#     openrouter_client = OpenAI(
-#         base_url="https://openrouter.ai/api/v1",
-#         api_key=os.getenv("OPENROUTER_API_KEY"),
-#     )
-# except Exception as e:
-#     logger.error(f"Failed to initialize API clients: {e}")
-#     raise RuntimeError(f"API initialization failed: {e}")
-
-# MODEL = "mistralai/mistral-7b-instruct:free"
-
-# VOICE_MAP = {
-#     "en": "jude",
-#     "ha": "aliyu",
-#     "yo": "femi",
-#     "ig": "obinna",
-#     "am": "default"  # Replace with actual Spitch Amharic voice if supported
-# }
-# DEFAULT_VOICE = "jude"
-# VALID_LANGUAGES = {"en", "ha", "yo", "ig", "am"}
-
-# def cleanup_static_files(max_age_seconds=3600):
-#     """Clean up old audio files."""
-#     try:
-#         for file in glob.glob(f"{STATIC_DIR}/*.wav"):
-#             if os.path.getmtime(file) < time.time() - max_age_seconds:
-#                 os.remove(file)
-#                 logger.info(f"Deleted old file: {file}")
-#     except Exception as e:
-#         logger.error(f"Failed to clean up static files: {e}")
-
-# def clean_language_code(lang: str) -> str:
-#     """Clean language code to ensure it's a valid ISO 639-1 code."""
-#     if not lang:
-#         return None
-#     # Remove quotes, whitespace, and non-lowercase letters
-#     cleaned = re.sub(r'[^a-z]', '', lang.strip().lower())
-#     return cleaned if cleaned in VALID_LANGUAGES else None
-
-# @app.post("/start_call")
-# async def start_call():
-#     """Asks user for preferred language and allows interruption."""
-#     try:
-#         text = "Welcome to proxy, What language do you want to speak in?"
-#         audio_response = spitch_client.speech.generate(
-#             text=text,
-#             language="en",
-#             voice=DEFAULT_VOICE
-#         )
-#         audio_bytes = audio_response.read()
-
-#         with tempfile.NamedTemporaryFile(suffix=".wav", dir=STATIC_DIR, delete=False) as temp_file:
-#             temp_file.write(audio_bytes)
-#             audio_filename = f"static/{os.path.basename(temp_file.name)}"
-
-#         twiml = VoiceResponse()
-#         gather = Gather(
-#             input="speech",
-#             action="/process_response",
-#             method="POST",
-#             speechTimeout="auto",
-#             timeout=10
-#         )
-#         gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
-#         twiml.append(gather)
-#         twiml.say("Sorry, I didn't catch that. Please try again.", voice="Polly.Joanna")
-#         twiml.redirect("/start_call", method="POST")
-#         cleanup_static_files()
-#         return Response(content=str(twiml), media_type="application/xml")
-#     except Exception as e:
-#         logger.error(f"Error in start_call: {e}")
-#         raise HTTPException(status_code=500, detail=f"Error in start_call: {str(e)}")
-
-# @app.post("/process_response")
-# async def process_response(
-#     audio: UploadFile = None,
-#     language: str = Form(None),
-#     RecordingUrl: str = Form(None),
-#     SpeechResult: str = Form(None)
-# ):
-#     """Processes user audio response."""
-#     try:
-#         if not SpeechResult and not RecordingUrl and not audio:
-#             logger.error("No audio input provided (SpeechResult, RecordingUrl, or UploadFile)")
-#             raise HTTPException(status_code=400, detail="No audio input provided")
-
-#         # Clean and validate language parameter if provided
-#         if language is not None:
-#             cleaned_language = clean_language_code(language)
-#             if cleaned_language not in VALID_LANGUAGES:
-#                 logger.error(f"Invalid language parameter: {language}")
-#                 raise HTTPException(status_code=400, detail=f"Invalid language '{language}'. Supported: {VALID_LANGUAGES}")
-#         else:
-#             cleaned_language = None
-
-#         if SpeechResult:
-#             transcribed_text = SpeechResult
-#             audio_io = None
-#         elif RecordingUrl:
-#             response = requests.get(RecordingUrl)
-#             response.raise_for_status()
-#             audio_bytes = response.content
-#             audio_io = io.BytesIO(audio_bytes)
-#         else:
-#             audio_bytes = await audio.read()
-#             audio_io = io.BytesIO(audio_bytes)
-
-#         if cleaned_language is not None:
-#             if audio_io:
-#                 transcription = spitch_client.speech.transcribe(
-#                     content=audio_io,
-#                     language=cleaned_language
-#                 )
-#                 transcribed_text = transcription.text
-#             else:
-#                 transcribed_text = SpeechResult
-
-#             if not transcribed_text:
-#                 logger.error("Transcription failed or returned empty text")
-#                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
-
-#             translation_to_en = spitch_client.text.translate(
-#                 text=transcribed_text,
-#                 source=cleaned_language,
-#                 target="en"
-#             )
-#             english_text = translation_to_en.text
-
-#             mistral_response = openrouter_client.chat.completions.create(
-#                 model=MODEL,
-#                 messages=[
-#                     {"role": "system", "content": "You are a helpful assistant."},
-#                     {"role": "user", "content": english_text}
-#                 ]
-#             )
-#             english_response = mistral_response.choices[0].message.content
-
-#             translation_back = spitch_client.text.translate(
-#                 text=english_response,
-#                 source="en",
-#                 target=cleaned_language
-#             )
-#             translated_response = translation_back.text
-
-#             voice = VOICE_MAP.get(cleaned_language, DEFAULT_VOICE)
-#             tts_audio = spitch_client.speech.generate(
-#                 text=translated_response,
-#                 language=cleaned_language,
-#                 voice=voice
-#             )
-#             audio_bytes = tts_audio.read()
-
-#             with tempfile.NamedTemporaryFile(suffix=".wav", dir=STATIC_DIR, delete=False) as temp_file:
-#                 temp_file.write(audio_bytes)
-#                 audio_filename = f"static/{os.path.basename(temp_file.name)}"
-
-#             twiml = VoiceResponse()
-#             gather = Gather(
-#                 input="speech",
-#                 action="/process_response",
-#                 method="POST",
-#                 speechTimeout="auto",
-#                 timeout=10
-#             )
-#             gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
-#             twiml.append(gather)
-#             twiml.redirect(f"/process_response?language={cleaned_language}", method="POST")
-#             cleanup_static_files()
-#             return Response(content=str(twiml), media_type="application/xml")
-
-#         else:
-#             if audio_io:
-#                 transcription = spitch_client.speech.transcribe(
-#                     content=audio_io,
-#                     language="en"
-#                 )
-#                 transcribed_text = transcription.text
-#             else:
-#                 transcribed_text = SpeechResult
-
-#             if not transcribed_text:
-#                 logger.error("Transcription failed or returned empty text")
-#                 raise HTTPException(status_code=400, detail="Transcription failed or empty")
-
-#             # Refined prompt to ensure only ISO 639-1 code is returned
-#             valid_languages = ["en", "yo", "ig", "ha", "am"]
-#             detection_prompt = (
-#                 f"The user said: '{transcribed_text}'. Identify the language they want to speak in and respond with "
-#                 f"only the ISO 639-1 code (e.g., 'ha' for Hausa, 'en' for English, 'yo' for Yoruba, 'ig' for Igbo, 'am' for Amharic). "
-#                 f"Return exactly one of {valid_languages} with no additional text, quotes, or modifications."
-#             )
-#             mistral_response = openrouter_client.chat.completions.create(
-#                 model=MODEL,
-#                 messages=[
-#                     {"role": "system", "content": "You are a language detector. Respond with only the ISO 639-1 code, without quotes or extra text."},
-#                     {"role": "user", "content": detection_prompt}
-#                 ]
-#             )
-#             detected_lang = mistral_response.choices[0].message.content.strip().lower()
-#             cleaned = clean_language_code(detected_lang)
-
-#             # Validate detected language
-#             if cleaned not in VALID_LANGUAGES:
-#                 logger.error(f"Invalid language detected: {cleaned}")
-#                 raise HTTPException(status_code=400, detail=f"Detected language '{cleaned}' is not supported. Supported: {VALID_LANGUAGES}")
-
-#             english_response = f"Okay, we will speak in {cleaned}."
-#             translation_back = spitch_client.text.translate(
-#                 text=english_response,
-#                 source="en",
-#                 target=cleaned
-#             )
-#             translated_response = translation_back.text
-
-#             voice = VOICE_MAP.get(cleaned, DEFAULT_VOICE)
-#             tts_audio = spitch_client.speech.generate(
-#                 text=translated_response,
-#                 language=cleaned,
-#                 voice=voice
-#             )
-#             audio_bytes = tts_audio.read()
-
-#             with tempfile.NamedTemporaryFile(suffix=".wav", dir=STATIC_DIR, delete=False) as temp_file:
-#                 temp_file.write(audio_bytes)
-#                 audio_filename = f"static/{os.path.basename(temp_file.name)}"
-
-#             twiml = VoiceResponse()
-#             gather = Gather(
-#                 input="speech",
-#                 action=f"/process_response?language={cleaned}",
-#                 method="POST",
-#                 speechTimeout="auto",
-#                 timeout=10
-#             )
-#             gather.play(url=f"https://spitchhack.onrender.com/{audio_filename}")
-#             twiml.append(gather)
-#             twiml.redirect(f"/process_response?language={cleaned}", method="POST")
-#             cleanup_static_files()
-#             return Response(content=str(twiml), media_type="application/xml")
-
-#     except Exception as e:
-#         logger.error(f"Error in process_response: {e}")
-#         raise HTTPException(status_code=500, detail=f"Error in process_response: {str(e)}")
