@@ -197,7 +197,6 @@ async def health():
     except Exception as e:
         status["services"]["openrouter"] = f"down: {e}"
     return status
-
 @app.websocket("/relay")
 async def relay_websocket(websocket: WebSocket):
     await websocket.accept()
@@ -205,6 +204,14 @@ async def relay_websocket(websocket: WebSocket):
     message_queue = asyncio.Queue()
     interrupted = False
     current_response_task = None
+
+    # Mocked voices for each language (replace with real Spitch voice IDs)
+    VOICES = {
+        "yo": "femi",     # Yoruba
+        "ig": "chioma",   # Igbo
+        "ha": "aminu",    # Hausa
+        "en": "jude"   # English
+    }
 
     async def receiver():
         while True:
@@ -227,8 +234,8 @@ async def relay_websocket(websocket: WebSocket):
             if message is None:
                 break
 
-            logger.debug("WebSocket event: %s", message)
             event_type = message.get("type")
+            logger.debug("WebSocket event: %s", message)
 
             if event_type == "setup":
                 call_sid = message.get("callSid")
@@ -245,14 +252,10 @@ async def relay_websocket(websocket: WebSocket):
                     logger.error("Missing or empty voicePrompt")
                     continue
 
-                #if there's an ongoing response, interrupt it
-                if current_response_task and not current_response_task.done():
-                    interrupted = True
-                    await asyncio.sleep(0)
-
                 _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
 
                 try:
+                    # Translate input → English
                     if lang_spitch != "en":
                         english_text = spitch_translate(user_text, source=lang_spitch, target="en")
                     else:
@@ -261,71 +264,71 @@ async def relay_websocket(websocket: WebSocket):
                     history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
                     history.append({"role": "user", "content": english_text})
 
-                    #reset interrupted for new response
+                    # reset interrupted for new response
                     interrupted = False
 
-                    async def stream_response():
+                    async def process_response():
                         nonlocal interrupted, history
                         reply_en = ""
-                        try:
-                            stream = await openrouter_client.chat.completions.create(
-                                model=MODEL,
-                                messages=history,
-                                stream=True
-                            )
-                            async for chunk in stream:
-                                if interrupted:
-                                    logger.info("Response interrupted")
-                                    break
-                                delta = chunk.choices[0].delta.content or ""
-                                if delta:
-                                    reply_en += delta
-                                    if lang_spitch != "en":
-                                        #translate delta (may not be perfect, but for streaming)
-                                        partial_local = spitch_translate(delta, source="en", target=lang_spitch)
-                                    else:
-                                        partial_local = delta
-                                    await websocket.send_text(
-                                        json.dumps({
-                                            "type": "text",
-                                            "token": partial_local,
-                                            "last": False,
-                                            "interruptible": True
-                                        })
-                                    )
-                            if not interrupted:
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "text",
-                                        "token": "",
-                                        "last": True
-                                    })
-                                )
-                                history.append({"role": "assistant", "content": reply_en})
-                                CONVERSATION_HISTORY[call_sid] = history[-20:]
-                            #if interrupted, do not add assistant message to history
-                        except Exception as e:
-                            logger.error(f"Error in stream_response: {e}")
-                            if not interrupted:
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "text",
-                                        "token": "Sorry, an error occurred. Please try again.",
-                                        "last": True
-                                    })
-                                )
 
-                    current_response_task = asyncio.create_task(stream_response())
+                        try:
+                            # get final LLM response in English
+                            resp = await openrouter_client.chat.completions.create(
+                                model=MODEL,
+                                messages=history
+                            )
+                            reply_en = resp.choices[0].message.content
+
+                            # Translate back to user language
+                            if lang_spitch != "en":
+                                reply_local = spitch_translate(reply_en, source="en", target=lang_spitch)
+                            else:
+                                reply_local = reply_en
+
+                            # TTS via Spitch
+                            voice_id = VOICES.get(lang_spitch, VOICES["en"])
+                            audio_resp = spitch_client.speech.generate(
+                                text=reply_local,
+                                language=lang_spitch,
+                                voice=voice_id
+                            )
+
+                            # Stream audio back to Twilio
+                            chunk_size = 3200  # adjust depending on Twilio format
+                            while True:
+                                chunk = audio_resp.read(chunk_size)
+                                if not chunk:
+                                    break
+                                await websocket.send_bytes(chunk)
+
+                            # End of stream marker
+                            await websocket.send_text(json.dumps({
+                                "type": "audio",
+                                "last": True
+                            }))
+
+                            # Save history
+                            history.append({"role": "assistant", "content": reply_en})
+                            CONVERSATION_HISTORY[call_sid] = history[-20:]
+
+                        except Exception as e:
+                            logger.error(f"Error in process_response: {e}")
+                            if not interrupted:
+                                await websocket.send_text(json.dumps({
+                                    "type": "text",
+                                    "token": "Sorry, an error occurred. Please try again.",
+                                    "last": True
+                                }))
+
+                    current_response_task = asyncio.create_task(process_response())
 
                 except Exception as e:
                     logger.error(f"Error processing prompt: {e}")
-                    await websocket.send_text(
-                        json.dumps({
-                            "type": "text",
-                            "token": "Sorry, an error occurred. Please try again.",
-                            "last": True
-                        })
-                    )
+                    await websocket.send_text(json.dumps({
+                        "type": "text",
+                        "token": "Sorry, an error occurred. Please try again.",
+                        "last": True
+                    }))
                 continue
 
             elif event_type == "speaker":
@@ -360,6 +363,169 @@ async def relay_websocket(websocket: WebSocket):
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
         await websocket.close()
+
+# @app.websocket("/relay")
+# async def relay_websocket(websocket: WebSocket):
+#     await websocket.accept()
+#     call_sid = None
+#     message_queue = asyncio.Queue()
+#     interrupted = False
+#     current_response_task = None
+
+#     async def receiver():
+#         while True:
+#             try:
+#                 data = await websocket.receive_text()
+#                 await message_queue.put(json.loads(data))
+#             except WebSocketDisconnect:
+#                 await message_queue.put(None)
+#                 break
+#             except Exception as e:
+#                 logger.error(f"Receiver error: {e}")
+#                 await message_queue.put(None)
+#                 break
+
+#     receive_task = asyncio.create_task(receiver())
+
+#     try:
+#         while True:
+#             message = await message_queue.get()
+#             if message is None:
+#                 break
+
+#             logger.debug("WebSocket event: %s", message)
+#             event_type = message.get("type")
+
+#             if event_type == "setup":
+#                 call_sid = message.get("callSid")
+#                 if not call_sid:
+#                     logger.error("Missing callSid in setup")
+#                     continue
+#                 CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
+#                 logger.info("Setup for CallSid %s", call_sid)
+#                 continue
+
+#             elif event_type == "prompt":
+#                 user_text = message.get("voicePrompt")
+#                 if not user_text or not user_text.strip():
+#                     logger.error("Missing or empty voicePrompt")
+#                     continue
+
+#                 #if there's an ongoing response, interrupt it
+#                 if current_response_task and not current_response_task.done():
+#                     interrupted = True
+#                     await asyncio.sleep(0)
+
+#                 _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
+
+#                 try:
+#                     if lang_spitch != "en":
+#                         english_text = spitch_translate(user_text, source=lang_spitch, target="en")
+#                     else:
+#                         english_text = user_text
+
+#                     history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
+#                     history.append({"role": "user", "content": english_text})
+
+#                     #reset interrupted for new response
+#                     interrupted = False
+
+#                     async def stream_response():
+#                         nonlocal interrupted, history
+#                         reply_en = ""
+#                         try:
+#                             stream = await openrouter_client.chat.completions.create(
+#                                 model=MODEL,
+#                                 messages=history,
+#                                 stream=True
+#                             )
+#                             async for chunk in stream:
+#                                 if interrupted:
+#                                     logger.info("Response interrupted")
+#                                     break
+#                                 delta = chunk.choices[0].delta.content or ""
+#                                 if delta:
+#                                     reply_en += delta
+#                                     if lang_spitch != "en":
+#                                         #translate delta (may not be perfect, but for streaming)
+#                                         partial_local = spitch_translate(delta, source="en", target=lang_spitch)
+#                                     else:
+#                                         partial_local = delta
+#                                     await websocket.send_text(
+#                                         json.dumps({
+#                                             "type": "text",
+#                                             "token": partial_local,
+#                                             "last": False,
+#                                             "interruptible": True
+#                                         })
+#                                     )
+#                             if not interrupted:
+#                                 await websocket.send_text(
+#                                     json.dumps({
+#                                         "type": "text",
+#                                         "token": "",
+#                                         "last": True
+#                                     })
+#                                 )
+#                                 history.append({"role": "assistant", "content": reply_en})
+#                                 CONVERSATION_HISTORY[call_sid] = history[-20:]
+#                             #if interrupted, do not add assistant message to history
+#                         except Exception as e:
+#                             logger.error(f"Error in stream_response: {e}")
+#                             if not interrupted:
+#                                 await websocket.send_text(
+#                                     json.dumps({
+#                                         "type": "text",
+#                                         "token": "Sorry, an error occurred. Please try again.",
+#                                         "last": True
+#                                     })
+#                                 )
+
+#                     current_response_task = asyncio.create_task(stream_response())
+
+#                 except Exception as e:
+#                     logger.error(f"Error processing prompt: {e}")
+#                     await websocket.send_text(
+#                         json.dumps({
+#                             "type": "text",
+#                             "token": "Sorry, an error occurred. Please try again.",
+#                             "last": True
+#                         })
+#                     )
+#                 continue
+
+#             elif event_type == "speaker":
+#                 if message.get("event") == "clientSpeaking":
+#                     logger.info("Client speaking detected - potential interruption")
+#                     interrupted = True
+#                 continue
+
+#             elif event_type == "dtmf":
+#                 logger.info("DTMF received: %s", message)
+#                 continue
+
+#             elif event_type == "error":
+#                 logger.error("Error received: %s", message)
+#                 continue
+
+#             elif event_type == "call_ended":
+#                 LANGUAGE_SELECTION.pop(call_sid, None)
+#                 CONVERSATION_HISTORY.pop(call_sid, None)
+#                 logger.info("Cleaned up for CallSid %s", call_sid)
+#                 continue
+
+#             logger.warning("Unknown event type: %s", event_type)
+
+#     except Exception as e:
+#         logger.error("WebSocket error: %s", e)
+#     finally:
+#         if current_response_task:
+#             current_response_task.cancel()
+#         receive_task.cancel()
+#         if call_sid:
+#             LANGUAGE_SELECTION.pop(call_sid, None)
+#             CONVERSATION_HISTORY.pop(call_sid, None)
+#         await websocket.close()
 
 
 #this commendted out block of code is for if you don't want Proxy to be able to be interrupted
