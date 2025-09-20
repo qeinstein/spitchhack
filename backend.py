@@ -16,6 +16,8 @@ import asyncio
 # ---- Config ----
 load_dotenv()
 
+app = FastAPI()
+
 # Validate environment variables
 required_vars = [
     "SPITCH_API_KEY",
