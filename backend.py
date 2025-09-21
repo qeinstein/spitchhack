@@ -35,7 +35,7 @@ SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODEL", "gemini-1.5-flash")  # Default to gemini-1.5-flash
+MODEL = os.getenv("MODEL", "gemini-2.5-flash")  # Default to gemini-1.5-flash
 SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Clients ----
