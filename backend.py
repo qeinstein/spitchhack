@@ -34,7 +34,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
-SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, Speak like a human. so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Clients ----
 try:
@@ -86,16 +86,14 @@ def spitch_translate(text: str, source: str, target: str) -> str:
 def spitch_tts(text: str, lang: str, voice: str) -> bytes:
     """
     Synthesize `text` to audio in `lang` using `voice` with Spitch API.
-    Assumes SDK method; adjust if necessary based on exact SDK documentation.
     """
     try:
-        resp = spitch_client.speech.synthesize(
+        resp = spitch_client.speech.generate(
             text=text,
             language=lang,
-            voice=voice,
-            format_="mp3"  # Adjust parameter name if needed (e.g., 'format')
+            voice=voice
         )
-        audio = getattr(resp, "audio", b"")
+        audio = resp.read()
         if not audio:
             raise RuntimeError("Empty audio from Spitch")
         return audio
@@ -193,7 +191,7 @@ async def get_audio(call_sid: str):
     voice = VOICE_MAP.get(lang_spitch, "Lina")
     try:
         audio_bytes = spitch_tts(local_text, lang_spitch, voice)
-        return Response(content=audio_bytes, media_type="audio/mpeg")
+        return Response(content=audio_bytes, media_type="audio/wav")  # Updated to WAV based on SDK default
     except Exception as e:
         logger.error(f"TTS failed for CallSid {call_sid}: {e}")
         raise HTTPException(status_code=500, detail="TTS generation failed")
@@ -380,7 +378,10 @@ async def relay_websocket(websocket: WebSocket):
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
             AUDIO_TEXT.pop(call_sid, None)
-        await websocket.close()
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass  # Ignore if already closed
 
 
 
