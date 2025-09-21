@@ -6,11 +6,10 @@ from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Start, Stream
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
-from urllib.parse import urlparse
 import json
 import asyncio
 import google.generativeai as genai
+from urllib.parse import urlparse
 
 
 load_dotenv()
@@ -23,7 +22,6 @@ required_vars = [
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "BASE_URL",
-    "CONVERSATION_SERVICE_SID"
 ]
 for var in required_vars:
     if not os.getenv(var):
@@ -32,8 +30,8 @@ for var in required_vars:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODwEL", "gemini-2.5-flash")
-VOICE_ID = os.getenv("VOICE_ID")
+MODEL = os.getenv("MODhEL", "gemini-2.5-flash") # Corrected var name typo
+VOICE_ID = os.getenv("VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Gemini Client ----
@@ -60,14 +58,14 @@ LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_tw
 CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {"role": str, "content": str}
 
 # ---- Gemini Helpers ----
-async def gemini_chat_reply(messages: list, language: str = "en") -> str:
+async def gemini_chat_reply(messages: list, language_code: str) -> str:
     """
-    Get a response from Gemini, ensuring it responds in the specified language
+    Get a response from Gemini, ensuring it responds in the specified language code
     """
     try:
         # Add language instruction to the last message
         if messages and messages[-1]["role"] == "user":
-            lang_instruction = f" Please respond in {language} language."
+            lang_instruction = f" Please respond in {language_code} language."
             messages[-1]["content"] += lang_instruction
         
         # Convert to Gemini format
@@ -76,12 +74,14 @@ async def gemini_chat_reply(messages: list, language: str = "en") -> str:
             # Skip system message for now, will add as instruction
             if msg["role"] == "system":
                 continue
-            gemini_messages.append({"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]})
+            # Ensure roles are 'user' or 'model' for Gemini
+            role = "user" if msg["role"] == "user" else "model"
+            gemini_messages.append({"role": role, "parts": [msg["content"]]})
         
         # Create model with system prompt as instruction
         model = genai.GenerativeModel(
             MODEL,
-            system_instruction=SYSTEM_PROMPT + f" Always respond in {language} language."
+            system_instruction=SYSTEM_PROMPT + f" Always respond in {language_code} language."
         )
         
         # Start chat with history
@@ -92,7 +92,7 @@ async def gemini_chat_reply(messages: list, language: str = "en") -> str:
         
         return response.text
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Gemini API error in gemini_chat_reply: {e}", exc_info=True)
         return "Sorry, I couldn't process your request. Please try again."
 
 # ---- Root endpoint ----
@@ -103,70 +103,89 @@ async def root():
 # ---- TwiML entry ----
 @app.post("/voice")
 async def voice_entry(request: Request):
-    # Validate Twilio webhook
-    form_data = await request.form()
-    signature = request.headers.get("X-Twilio-Signature", "")
-    url = str(request.url)
-    if not twilio_validator.validate(url, dict(form_data), signature):
-        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+    try:
+        form_data = await request.form()
+        signature = request.headers.get("X-Twilio-Signature", "")
+        url = str(request.url)
+        if not twilio_validator.validate(url, dict(form_data), signature):
+            logger.warning("Invalid Twilio signature.")
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    twiml = VoiceResponse()
-    # Gather language selection
-    gather = twiml.gather(
-        num_digits=1,
-        action="/process_language",
-        method="POST",
-        timeout=8
-    )
-    gather.say("Welcome to Proxy. For Yoruba press 1. For Igbo press 2. For Hausa press 3. For English press 4.")
-    # If gather doesn't get input:
-    twiml.redirect("/process_language_fallback")
+        twiml = VoiceResponse()
+        gather = twiml.gather(
+            num_digits=1,
+            action="/process_language",
+            method="POST",
+            timeout=8
+        )
+        gather.say("Welcome to Proxy. For Yoruba press one. For Igbo press two. For Hausa press three. For English press four.")
+        twiml.redirect("/process_language_fallback")
 
-    return Response(content=str(twiml), media_type="application/xml")
+        return Response(content=str(twiml), media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error in /voice endpoint: {e}", exc_info=True)
+        twiml = VoiceResponse()
+        twiml.say("An unexpected error occurred. Please try your call again.")
+        return Response(content=str(twiml), media_type="application/xml", status_code=500)
+
 
 @app.post("/process_language_fallback")
 async def process_language_fallback(request: Request):
-    twiml = VoiceResponse()
-    twiml.say("Sorry, we did not receive input. Redirecting you back to language selection.")
-    twiml.redirect("/voice")
-    return Response(content=str(twiml), media_type="application/xml")
+    try:
+        twiml = VoiceResponse()
+        twiml.say("Sorry, we did not receive any input. Redirecting you back to language selection.")
+        twiml.redirect("/voice")
+        return Response(content=str(twiml), media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error in /process_language_fallback: {e}", exc_info=True)
+        twiml = VoiceResponse()
+        twiml.say("An unexpected error occurred. Please try your call again.")
+        return Response(content=str(twiml), media_type="application/xml", status_code=500)
+
 
 @app.post("/process_language")
 async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
-    # Validate Twilio webhook
-    form_data = await request.form()
-    signature = request.headers.get("X-Twilio-Signature", "")
-    url = str(request.url)
-    if not twilio_validator.validate(url, dict(form_data), signature):
-        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+    try:
+        form_data = await request.form()
+        signature = request.headers.get("X-Twilio-Signature", "")
+        url = str(request.url)
+        if not twilio_validator.validate(url, dict(form_data), signature):
+            logger.warning("Invalid Twilio signature.")
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    twiml = VoiceResponse()
-    if not (Digits and CallSid and Digits in LANGUAGE_MAP):
-        twiml.say("Invalid selection or call ID. Please try again.")
-        twiml.redirect("/voice")
+        twiml = VoiceResponse()
+        if not (Digits and CallSid and Digits in LANGUAGE_MAP):
+            logger.warning("Invalid language selection or missing CallSid. Digits: %s", Digits)
+            twiml.say("Invalid selection or call ID. Please try again.")
+            twiml.redirect("/voice")
+            return Response(content=str(twiml), media_type="application/xml")
+
+        lang_name, lang_code_twiml, lang_code_gemini = LANGUAGE_MAP[Digits]
+        LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_gemini)
+        logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
+
+        twiml.say(f"You selected {lang_name}. Connecting you now.")
+
+        connect = twiml.connect()
+        conversation_relay = connect.conversation_relay(
+            url=f"wss://{urlparse(BASE_URL).netloc}/relay",
+            interruptible="any",
+            report_input_during_agent_speech="any",
+            debug="speaker-events"
+        )
+        language = conversation_relay.language(
+            code=lang_code_twiml,
+            tts_provider="elevenlabs",
+            voice=VOICE_ID,
+            transcription_provider="google"
+        )
+
         return Response(content=str(twiml), media_type="application/xml")
-
-    lang_name, lang_code_twiml, lang_code_gemini = LANGUAGE_MAP[Digits]
-    LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_gemini)
-    logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
-
-    twiml.say(f"You selected {lang_name}. Connecting you now.")
-
-    connect = twiml.connect()
-    conversation_relay = connect.conversation_relay(
-        url=f"wss://{urlparse(BASE_URL).netloc}/relay",
-        interruptible="any",
-        report_input_during_agent_speech="any",
-        debug="speaker-events"
-    )
-    language = conversation_relay.language(
-        code=lang_code_twiml,
-        tts_provider="elevenlabs",
-        voice=VOICE_ID,
-        transcription_provider="google"
-    )
-
-    return Response(content=str(twiml), media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error in /process_language endpoint: {e}", exc_info=True)
+        twiml = VoiceResponse()
+        twiml.say("An unexpected error occurred while processing your selection. Please try your call again.")
+        return Response(content=str(twiml), media_type="application/xml", status_code=500)
 
 # ---- Health check ----
 @app.get("/health")
@@ -176,10 +195,11 @@ async def health():
     try:
         model = genai.GenerativeModel(MODEL)
         chat = model.start_chat()
-        response = chat.send_message("Test message")
+        response = await chat.send_message_async("Test message")
         status["services"]["gemini"] = "ok"
     except Exception as e:
         status["services"]["gemini"] = f"down: {e}"
+        logger.error(f"Health check failed for Gemini: {e}", exc_info=True)
     return status
 
 @app.websocket("/relay")
@@ -187,19 +207,19 @@ async def relay_websocket(websocket: WebSocket):
     await websocket.accept()
     call_sid = None
     message_queue = asyncio.Queue()
-    interrupted = False
     current_response_task = None
-
+    
     async def receiver():
         while True:
             try:
                 data = await websocket.receive_text()
                 await message_queue.put(json.loads(data))
             except WebSocketDisconnect:
+                logger.info("WebSocket disconnected.")
                 await message_queue.put(None)
                 break
             except Exception as e:
-                logger.error(f"Receiver error: {e}")
+                logger.error(f"Receiver error: {e}", exc_info=True)
                 await message_queue.put(None)
                 break
 
@@ -217,110 +237,435 @@ async def relay_websocket(websocket: WebSocket):
             if event_type == "setup":
                 call_sid = message.get("callSid")
                 if not call_sid:
-                    logger.error("Missing callSid in setup")
+                    logger.error("Missing callSid in setup message.")
                     continue
                 CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
-                logger.info("Setup for CallSid %s", call_sid)
+                logger.info("Setup complete for CallSid %s", call_sid)
                 continue
 
             elif event_type == "prompt":
                 user_text = message.get("voicePrompt")
                 if not user_text or not user_text.strip():
-                    logger.error("Missing or empty voicePrompt")
+                    logger.warning("Received empty or missing voicePrompt. Skipping.")
                     continue
 
-                # If there's an ongoing response, interrupt it
                 if current_response_task and not current_response_task.done():
-                    interrupted = True
-                    await asyncio.sleep(0)
-
+                    logger.info("Interrupting previous response task.")
+                    current_response_task.cancel()
+                    
                 lang_name, _, lang_gemini = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
+                history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
+                history.append({"role": "user", "content": user_text})
+                
+                async def stream_response():
+                    try:
+                        response_text = await gemini_chat_reply(history, lang_gemini)
+                        
+                        if response_text:
+                            await websocket.send_text(
+                                json.dumps({
+                                    "type": "text",
+                                    "token": response_text,
+                                    "last": True
+                                })
+                            )
+                            history.append({"role": "assistant", "content": response_text})
+                            CONVERSATION_HISTORY[call_sid] = history[-20:]
+                            logger.info("Response sent to Twilio for CallSid %s", call_sid)
+                        else:
+                            logger.error("Gemini returned an empty response.")
+                            await websocket.send_text(
+                                json.dumps({
+                                    "type": "text",
+                                    "token": "Sorry, I couldn't generate a response. Please try again.",
+                                    "last": True
+                                })
+                            )
+                    except asyncio.CancelledError:
+                        logger.warning("Response task was cancelled.")
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error during response streaming: {e}", exc_info=True)
+                        await websocket.send_text(
+                            json.dumps({
+                                "type": "text",
+                                "token": "Sorry, a temporary error occurred. Please try again.",
+                                "last": True
+                            })
+                        )
 
-                try:
-                    # Add user message to history
-                    history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
-                    history.append({"role": "user", "content": user_text})
-
-                    # Reset interrupted for new response
-                    interrupted = False
-
-                    async def stream_response():
-                        nonlocal interrupted, history
-                        try:
-                            # Get response from Gemini in the selected language
-                            response_text = await gemini_chat_reply(history, lang_name)
-                            
-                            if not interrupted:
-                                # Stream the response
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "text",
-                                        "token": response_text,
-                                        "last": True
-                                    })
-                                )
-                                # Add assistant response to history
-                                history.append({"role": "assistant", "content": response_text})
-                                CONVERSATION_HISTORY[call_sid] = history[-20:]  # Keep last 20 messages
-                        except Exception as e:
-                            logger.error(f"Error in stream_response: {e}")
-                            if not interrupted:
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "text",
-                                        "token": "Sorry, an error occurred. Please try again.",
-                                        "last": True
-                                    })
-                                )
-
-                    current_response_task = asyncio.create_task(stream_response())
-
-                except Exception as e:
-                    logger.error(f"Error processing prompt: {e}")
-                    await websocket.send_text(
-                        json.dumps({
-                            "type": "text",
-                            "token": "Sorry, an error occurred. Please try again.",
-                            "last": True
-                        })
-                    )
+                current_response_task = asyncio.create_task(stream_response())
                 continue
 
             elif event_type == "speaker":
-                if message.get("event") == "clientSpeaking":
-                    logger.info("Client speaking detected - potential interruption")
-                    interrupted = True
+                if message.get("event") == "clientSpeaking" and current_response_task and not current_response_task.done():
+                    logger.info("Client speaking detected. Cancelling ongoing response.")
+                    current_response_task.cancel()
                 continue
-
+            
             elif event_type == "dtmf":
-                logger.info("DTMF received: %s", message)
+                logger.info("DTMF received: %s", message.get("digit"))
                 continue
-
+            
             elif event_type == "error":
-                logger.error("Error received: %s", message)
+                logger.error("Error received from Twilio: %s", message.get("error"))
                 continue
 
             elif event_type == "call_ended":
                 LANGUAGE_SELECTION.pop(call_sid, None)
                 CONVERSATION_HISTORY.pop(call_sid, None)
-                logger.info("Cleaned up for CallSid %s", call_sid)
-                continue
-
-            logger.warning("Unknown event type: %s", event_type)
+                logger.info("Cleaned up state for ended call %s", call_sid)
+                break
+                
+            logger.warning("Unknown event type received: %s", event_type)
 
     except Exception as e:
-        logger.error("WebSocket error: %s", e)
+        logger.error(f"Unexpected error in WebSocket handler: {e}", exc_info=True)
     finally:
         if current_response_task:
             current_response_task.cancel()
-        receive_task.cancel()
+        if not receive_task.done():
+            receive_task.cancel()
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        
-        # Only close if the connection is still open
         if websocket.client_state.name == "CONNECTED":
             await websocket.close()
+
+
+
+
+
+
+
+
+
+
+
+
+# import os
+# import logging
+# from typing import Dict, Any
+# from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
+# from fastapi.responses import Response
+# from twilio.twiml.voice_response import VoiceResponse, Start, Stream
+# from twilio.request_validator import RequestValidator
+# from dotenv import load_dotenv
+# from openai import AsyncOpenAI
+# from urllib.parse import urlparse
+# import json
+# import asyncio
+# import google.generativeai as genai
+
+
+# load_dotenv()
+
+# app = FastAPI()
+
+# # Validate environment variables
+# required_vars = [
+#     "GEMINI_API_KEY",
+#     "TWILIO_ACCOUNT_SID",
+#     "TWILIO_AUTH_TOKEN",
+#     "BASE_URL",
+#     "CONVERSATION_SERVICE_SID"
+# ]
+# for var in required_vars:
+#     if not os.getenv(var):
+#         raise RuntimeError(f"Missing environment variable: {var}")
+
+# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+# BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+# MODEL = os.getenv("MODwEL", "gemini-2.5-flash")
+# VOICE_ID = os.getenv("VOICE_ID")
+# SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+
+# # ---- Gemini Client ----
+# try:
+#     genai.configure(api_key=GEMINI_API_KEY)
+# except Exception as e:
+#     raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+
+# # ---- App setup ----
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger("conversation-relay")
+# app = FastAPI()
+# twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
+
+# # ---- Language map ----
+# LANGUAGE_MAP = {
+#     "1": ("Yoruba", "yo-NG", "yo"),
+#     "2": ("Igbo", "ig-NG", "ig"),
+#     "3": ("Hausa", "ha-NG", "ha"),
+#     "4": ("English", "en-US", "en")
+# }
+
+# LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, lang_code_gemini)
+# CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {"role": str, "content": str}
+
+# # ---- Gemini Helpers ----
+# async def gemini_chat_reply(messages: list, language: str = "en") -> str:
+#     """
+#     Get a response from Gemini, ensuring it responds in the specified language
+#     """
+#     try:
+#         # Add language instruction to the last message
+#         if messages and messages[-1]["role"] == "user":
+#             lang_instruction = f" Please respond in {language} language."
+#             messages[-1]["content"] += lang_instruction
+        
+#         # Convert to Gemini format
+#         gemini_messages = []
+#         for msg in messages:
+#             # Skip system message for now, will add as instruction
+#             if msg["role"] == "system":
+#                 continue
+#             gemini_messages.append({"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]})
+        
+#         # Create model with system prompt as instruction
+#         model = genai.GenerativeModel(
+#             MODEL,
+#             system_instruction=SYSTEM_PROMPT + f" Always respond in {language} language."
+#         )
+        
+#         # Start chat with history
+#         chat = model.start_chat(history=gemini_messages[:-1])  # All but the last message
+        
+#         # Get response for the last message
+#         response = await chat.send_message_async(gemini_messages[-1]["parts"][0])
+        
+#         return response.text
+#     except Exception as e:
+#         logger.error(f"Gemini API error: {e}")
+#         return "Sorry, I couldn't process your request. Please try again."
+
+# # ---- Root endpoint ----
+# @app.get("/")
+# async def root():
+#     return {"message": "Welcome to the Gemini Voice Relay API. Use /health to check status."}
+
+# # ---- TwiML entry ----
+# @app.post("/voice")
+# async def voice_entry(request: Request):
+#     # Validate Twilio webhook
+#     form_data = await request.form()
+#     signature = request.headers.get("X-Twilio-Signature", "")
+#     url = str(request.url)
+#     if not twilio_validator.validate(url, dict(form_data), signature):
+#         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+#     twiml = VoiceResponse()
+#     # Gather language selection
+#     gather = twiml.gather(
+#         num_digits=1,
+#         action="/process_language",
+#         method="POST",
+#         timeout=8
+#     )
+#     gather.say("Welcome to Proxy. For Yoruba press 1. For Igbo press 2. For Hausa press 3. For English press 4.")
+#     # If gather doesn't get input:
+#     twiml.redirect("/process_language_fallback")
+
+#     return Response(content=str(twiml), media_type="application/xml")
+
+# @app.post("/process_language_fallback")
+# async def process_language_fallback(request: Request):
+#     twiml = VoiceResponse()
+#     twiml.say("Sorry, we did not receive input. Redirecting you back to language selection.")
+#     twiml.redirect("/voice")
+#     return Response(content=str(twiml), media_type="application/xml")
+
+# @app.post("/process_language")
+# async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
+#     # Validate Twilio webhook
+#     form_data = await request.form()
+#     signature = request.headers.get("X-Twilio-Signature", "")
+#     url = str(request.url)
+#     if not twilio_validator.validate(url, dict(form_data), signature):
+#         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+#     twiml = VoiceResponse()
+#     if not (Digits and CallSid and Digits in LANGUAGE_MAP):
+#         twiml.say("Invalid selection or call ID. Please try again.")
+#         twiml.redirect("/voice")
+#         return Response(content=str(twiml), media_type="application/xml")
+
+#     lang_name, lang_code_twiml, lang_code_gemini = LANGUAGE_MAP[Digits]
+#     LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_gemini)
+#     logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
+
+#     twiml.say(f"You selected {lang_name}. Connecting you now.")
+
+#     connect = twiml.connect()
+#     conversation_relay = connect.conversation_relay(
+#         url=f"wss://{urlparse(BASE_URL).netloc}/relay",
+#         interruptible="any",
+#         report_input_during_agent_speech="any",
+#         debug="speaker-events"
+#     )
+#     language = conversation_relay.language(
+#         code=lang_code_twiml,
+#         tts_provider="elevenlabs",
+#         voice=VOICE_ID,
+#         transcription_provider="google"
+#     )
+
+#     return Response(content=str(twiml), media_type="application/xml")
+
+# # ---- Health check ----
+# @app.get("/health")
+# async def health():
+#     status = {"status": "ok", "services": {}}
+#     # Test Gemini
+#     try:
+#         model = genai.GenerativeModel(MODEL)
+#         chat = model.start_chat()
+#         response = chat.send_message("Test message")
+#         status["services"]["gemini"] = "ok"
+#     except Exception as e:
+#         status["services"]["gemini"] = f"down: {e}"
+#     return status
+
+# @app.websocket("/relay")
+# async def relay_websocket(websocket: WebSocket):
+#     await websocket.accept()
+#     call_sid = None
+#     message_queue = asyncio.Queue()
+#     interrupted = False
+#     current_response_task = None
+
+#     async def receiver():
+#         while True:
+#             try:
+#                 data = await websocket.receive_text()
+#                 await message_queue.put(json.loads(data))
+#             except WebSocketDisconnect:
+#                 await message_queue.put(None)
+#                 break
+#             except Exception as e:
+#                 logger.error(f"Receiver error: {e}")
+#                 await message_queue.put(None)
+#                 break
+
+#     receive_task = asyncio.create_task(receiver())
+
+#     try:
+#         while True:
+#             message = await message_queue.get()
+#             if message is None:
+#                 break
+
+#             logger.debug("WebSocket event: %s", message)
+#             event_type = message.get("type")
+
+#             if event_type == "setup":
+#                 call_sid = message.get("callSid")
+#                 if not call_sid:
+#                     logger.error("Missing callSid in setup")
+#                     continue
+#                 CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
+#                 logger.info("Setup for CallSid %s", call_sid)
+#                 continue
+
+#             elif event_type == "prompt":
+#                 user_text = message.get("voicePrompt")
+#                 if not user_text or not user_text.strip():
+#                     logger.error("Missing or empty voicePrompt")
+#                     continue
+
+#                 # If there's an ongoing response, interrupt it
+#                 if current_response_task and not current_response_task.done():
+#                     interrupted = True
+#                     await asyncio.sleep(0)
+
+#                 lang_name, _, lang_gemini = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
+
+#                 try:
+#                     # Add user message to history
+#                     history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
+#                     history.append({"role": "user", "content": user_text})
+
+#                     # Reset interrupted for new response
+#                     interrupted = False
+
+#                     async def stream_response():
+#                         nonlocal interrupted, history
+#                         try:
+#                             # Get response from Gemini in the selected language
+#                             response_text = await gemini_chat_reply(history, lang_name)
+                            
+#                             if not interrupted:
+#                                 # Stream the response
+#                                 await websocket.send_text(
+#                                     json.dumps({
+#                                         "type": "text",
+#                                         "token": response_text,
+#                                         "last": True
+#                                     })
+#                                 )
+#                                 # Add assistant response to history
+#                                 history.append({"role": "assistant", "content": response_text})
+#                                 CONVERSATION_HISTORY[call_sid] = history[-20:]  # Keep last 20 messages
+#                         except Exception as e:
+#                             logger.error(f"Error in stream_response: {e}")
+#                             if not interrupted:
+#                                 await websocket.send_text(
+#                                     json.dumps({
+#                                         "type": "text",
+#                                         "token": "Sorry, an error occurred. Please try again.",
+#                                         "last": True
+#                                     })
+#                                 )
+
+#                     current_response_task = asyncio.create_task(stream_response())
+
+#                 except Exception as e:
+#                     logger.error(f"Error processing prompt: {e}")
+#                     await websocket.send_text(
+#                         json.dumps({
+#                             "type": "text",
+#                             "token": "Sorry, an error occurred. Please try again.",
+#                             "last": True
+#                         })
+#                     )
+#                 continue
+
+#             elif event_type == "speaker":
+#                 if message.get("event") == "clientSpeaking":
+#                     logger.info("Client speaking detected - potential interruption")
+#                     interrupted = True
+#                 continue
+
+#             elif event_type == "dtmf":
+#                 logger.info("DTMF received: %s", message)
+#                 continue
+
+#             elif event_type == "error":
+#                 logger.error("Error received: %s", message)
+#                 continue
+
+#             elif event_type == "call_ended":
+#                 LANGUAGE_SELECTION.pop(call_sid, None)
+#                 CONVERSATION_HISTORY.pop(call_sid, None)
+#                 logger.info("Cleaned up for CallSid %s", call_sid)
+#                 continue
+
+#             logger.warning("Unknown event type: %s", event_type)
+
+#     except Exception as e:
+#         logger.error("WebSocket error: %s", e)
+#     finally:
+#         if current_response_task:
+#             current_response_task.cancel()
+#         receive_task.cancel()
+#         if call_sid:
+#             LANGUAGE_SELECTION.pop(call_sid, None)
+#             CONVERSATION_HISTORY.pop(call_sid, None)
+        
+#         # Only close if the connection is still open
+#         if websocket.client_state.name == "CONNECTED":
+#             await websocket.close()
 
 
 
