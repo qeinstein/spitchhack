@@ -9,6 +9,7 @@ from twilio.twiml.voice_response import VoiceResponse
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
 import google.generativeai as genai
+from fastapi.responses import Response
 from urllib.parse import urlparse
 
 load_dotenv()
