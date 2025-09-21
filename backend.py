@@ -61,11 +61,14 @@ twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 # }
 # ---- Language map ----
 # Format: { Digit: (Language Name, Twilio Lang Code, Spitch Lang Code, Spitch Voice ID) }
+# ---- Language map ----
+# Using REAL ElevenLabs Voice IDs for your Spitch voices
 LANGUAGE_MAP = {
-    "1": ("Yoruba", "yo-NG", "yo", "femi"),    # Replace "femi" with your Yoruba voice ID
-    "2": ("Igbo", "ig-NG", "ig", "chioma"),  # Replace "chioma" with your Igbo voice ID
-    "3": ("Hausa", "ha-NG", "ha", "aminu"),   # Replace "aminu" with your Hausa voice ID
-    "4": ("English", "en-US", "en", "jude")     # Replace "jude" with your English voice ID
+    # Replace these placeholder IDs with the actual IDs from your ElevenLabs account
+    "1": ("Yoruba", "yo-NG", "yo", "LkjahaS8dsa9d8asJHDak"),    # Placeholder for Femi's ElevenLabs ID
+    "2": ("Igbo", "ig-NG", "ig", "asdKJhasd87asdhjASdjs"),  # Placeholder for Chioma's ElevenLabs ID
+    "3": ("Hausa", "ha-NG", "ha", "oiasdJOIasd88asdASDas"),   # Placeholder for Aminu's ElevenLabs ID
+    "4": ("English", "en-US", "en", "21m00Tcm4TlvDq8ikWAM")     # Example: A real ElevenLabs ID (Rachel)
 }
 
 # LANGUAGE_SELECTION: Dict[str, str] = {}  # CallSid -> lang code
@@ -136,7 +139,12 @@ async def process_language_fallback(request: Request):
 
 @app.post("/process_language")
 async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
-    # Validate Twilio webhook
+    """
+    Handles the user's language selection from the IVR menu.
+    Generates TwiML to connect the call to the ConversationRelay WebSocket
+    with the correct language and voice settings.
+    """
+    # 1. Validate that the request is genuinely from Twilio
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -144,24 +152,27 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     twiml = VoiceResponse()
+
+    # 2. Check if the user's input is valid
     if not (Digits and CallSid and Digits in LANGUAGE_MAP):
         twiml.say("Invalid selection. Please try again.")
         twiml.redirect("/voice")
         return Response(content=str(twiml), media_type="application/xml")
 
-    # Unpack all four values, including the new voice_id
+    # 3. Look up all necessary info from the map using the digit pressed
     lang_name, lang_code_twiml, lang_code_spitch, voice_id = LANGUAGE_MAP[Digits]
     
-    # Store the full tuple for later use
-    LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch) # Storing original tuple is fine
+    # Store the chosen language for the WebSocket handler to use later
+    LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
     
     logger.info(
-        "Language set for CallSid %s -> %s (Voice ID: %s)",
+        "Language set for CallSid %s -> %s (Using ElevenLabs Voice ID: %s)",
         CallSid, lang_name, voice_id
     )
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
 
+    # 4. Create the <Connect> and <ConversationRelay> TwiML verbs
     connect = twiml.connect()
     conversation_relay = connect.conversation_relay(
         url=f"wss://{urlparse(BASE_URL).netloc}/relay",
@@ -170,15 +181,17 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         debug="speaker-events"
     )
     
-    # **This is the key change**
-    # We now set the voice provider to "spitch" and use the specific voice_id
+    # 5. This is the crucial part: Configure the voice
+    #    Tell Twilio to use "elevenlabs" as the TTS service and provide
+    #    the specific voice ID you defined in your LANGUAGE_MAP.
     language = conversation_relay.language(
         code=lang_code_twiml,
-        tts_provider="spitch",
+        tts_provider="elevenlabs",
         voice=voice_id,
         transcription_provider="google"
     )
 
+    # 6. Return the complete TwiML to Twilio
     return Response(content=str(twiml), media_type="application/xml")
 # @app.post("/process_language")
 # async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
