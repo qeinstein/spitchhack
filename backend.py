@@ -32,7 +32,7 @@ SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODEqL", "gemini-2.5-flash")
+MODEL = os.getenv("MODEL", "gemini-2.5-flash")
 SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Clients ----
@@ -149,7 +149,6 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
     lang_name, lang_code_twiml, lang_code_spitch = LANGUAGE_MAP[Digits]
     LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
     logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
-
     twiml.say(f"You selected {lang_name}. Connecting you now.")
     
     connect = Connect()
