@@ -58,10 +58,10 @@ LANGUAGE_MAP = {
 }
 
 VOICE_MAP = {
-    "yo": "Sade",
-    "ig": "Ngozi",
-    "ha": "Amina",
-    "en": "Lina"
+    "yo": "sade",
+    "ig": "ngozi",
+    "ha": "amina",
+    "en": "lina"
 }
 
 LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, lang_code_spitch)
