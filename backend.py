@@ -222,7 +222,7 @@ async def relay_ws(ws: WebSocket):
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        await ws.close()
+        # await ws.close()
 
 
 
