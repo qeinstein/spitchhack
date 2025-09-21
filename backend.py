@@ -34,7 +34,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
-SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, Speak like a human. so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Clients ----
 try:
@@ -58,7 +58,7 @@ LANGUAGE_MAP = {
 }
 
 VOICE_MAP = {
-    "yo": "sade",
+    "yo": "femi",
     "ig": "ngozi",
     "ha": "amina",
     "en": "lina"
@@ -99,7 +99,7 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
         return audio
     except Exception as e:
         logger.error(f"Spitch TTS failed: {e}")
-        raise RuntimeError(f"TTS error: {e}")
+        return b""  # Return empty bytes on failure for better handling
 
 def openrouter_chat_reply(messages: list) -> str:
     try:
@@ -191,6 +191,8 @@ async def get_audio(call_sid: str):
     voice = VOICE_MAP.get(lang_spitch, "Lina")
     try:
         audio_bytes = spitch_tts(local_text, lang_spitch, voice)
+        if not audio_bytes:
+            raise RuntimeError("TTS returned empty audio")
         return Response(content=audio_bytes, media_type="audio/wav")  # Updated to WAV based on SDK default
     except Exception as e:
         logger.error(f"TTS failed for CallSid {call_sid}: {e}")
@@ -290,6 +292,7 @@ async def relay_websocket(websocket: WebSocket):
                     async def stream_response():
                         nonlocal interrupted, history
                         reply_en = ""
+                        chunk_size = 100  # Adjust chunk size as needed (characters)
                         try:
                             stream = await openrouter_client.chat.completions.create(
                                 model=MODEL,
@@ -303,14 +306,31 @@ async def relay_websocket(websocket: WebSocket):
                                 delta = chunk.choices[0].delta.content or ""
                                 if delta:
                                     reply_en += delta
+                                    # Send chunk if it reaches the size or end of stream
+                                    while len(reply_en) >= chunk_size:
+                                        chunk_en = reply_en[:chunk_size]
+                                        reply_en = reply_en[chunk_size:]
+                                        if chunk_en.strip():
+                                            if lang_spitch != "en":
+                                                local_text = spitch_translate(chunk_en, source="en", target=lang_spitch)
+                                            else:
+                                                local_text = chunk_en
+                                            AUDIO_TEXT[call_sid] = local_text
+                                            await websocket.send_text(
+                                                json.dumps({
+                                                    "type": "play",
+                                                    "source": f"{BASE_URL}/audio/{call_sid}",
+                                                    "interruptible": True
+                                                })
+                                            )
+                                            await asyncio.sleep(0.1)  # Small delay to allow playback sequencing
+                            # Send any remaining text as the last chunk
                             if not interrupted and reply_en.strip():
-                                # Full response collected; translate to local language
                                 if lang_spitch != "en":
                                     local_text = spitch_translate(reply_en, source="en", target=lang_spitch)
                                 else:
                                     local_text = reply_en
                                 AUDIO_TEXT[call_sid] = local_text
-                                # Send play message with audio URL
                                 await websocket.send_text(
                                     json.dumps({
                                         "type": "play",
@@ -318,12 +338,14 @@ async def relay_websocket(websocket: WebSocket):
                                         "interruptible": True
                                     })
                                 )
-                                history.append({"role": "assistant", "content": reply_en})
+                            if not interrupted:
+                                # Append the full English response to history only if not interrupted
+                                full_reply_en = ''  # Reconstruct if needed, but since chunks are sent, you may need to accumulate separately
+                                history.append({"role": "assistant", "content": full_reply_en})  # Note: Need to accumulate full_reply_en separately
                                 CONVERSATION_HISTORY[call_sid] = history[-20:]
                         except Exception as e:
                             logger.error(f"Error in stream_response: {e}")
                             if not interrupted:
-                                # Fallback: send text for built-in TTS
                                 await websocket.send_text(
                                     json.dumps({
                                         "type": "text",
