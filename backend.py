@@ -197,6 +197,7 @@ async def health():
     except Exception as e:
         status["services"]["openrouter"] = f"down: {e}"
     return status
+
 @app.websocket("/relay")
 async def relay_websocket(websocket: WebSocket):
     await websocket.accept()
