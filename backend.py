@@ -292,8 +292,8 @@ async def relay_websocket(websocket: WebSocket):
                 logger.error("Error received: %s", message)
                 continue
 
-            elif event_type
-::contentReference[oaicite:0]{index=0}
+            else:
+                contentReference[oaicite:0]{index=0}
  
 
 
