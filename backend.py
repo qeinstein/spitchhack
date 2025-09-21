@@ -8,6 +8,7 @@ from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
 from spitch import Spitch
 import google.generativeai as genai
+from urllib.parse import urlparse
 import json
 import asyncio
 import base64
