@@ -37,10 +37,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 MODEL = os.getenv("MODEL", "gemini-2.5-flash")
-SYSTEM_PROMPT = "You are a helpful assistant named Proxy.Respond Like a normal human. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+SYSTEM_PROMPT = "You are a helpful assistant named Proxy. Respond like a human. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Logging Setup ----
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, filename="app.log")  # Save logs to file
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
@@ -59,6 +59,7 @@ try:
     spitch_client = Spitch(api_key=SPITCH_API_KEY)
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_client = genai.GenerativeModel(MODEL)
+    twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)  # FIXED: Initialize validator
 except Exception as e:
     logger.error("Failed to initialize clients", error=str(e))
     raise RuntimeError(f"Failed to initialize clients: {e}")
@@ -130,6 +131,13 @@ async def voice_entry(request: Request):
 
 @app.post("/process_language_fallback")
 async def process_language_fallback(request: Request):
+    form_data = await request.form()
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = str(request.url)
+    if not twilio_validator.validate(url, dict(form_data), signature):
+        logger.error("Invalid Twilio signature", url=url)
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
     twiml = VoiceResponse()
     twiml.say("Sorry, we did not receive input. Redirecting you back to language selection.")
     twiml.redirect("/voice")
@@ -219,9 +227,9 @@ async def relay_websocket(websocket: WebSocket):
                 try:
                     parsed = json.loads(data)
                     await message_queue.put(parsed)
-                    logger.debug("WebSocket message received", raw_message=parsed)
+                    logger.debug("WebSocket message received", raw_message=parsed, call_sid=call_sid)
                 except json.JSONDecodeError:
-                    logger.warning("Invalid JSON received", raw_data=data)
+                    logger.warning("Invalid JSON received", raw_data=data, call_sid=call_sid)
                     await message_queue.put(None)
             except WebSocketDisconnect:
                 logger.info("WebSocket disconnected", call_sid=call_sid)
@@ -252,14 +260,14 @@ async def relay_websocket(websocket: WebSocket):
                 call_sid = message.get("callSid")
                 stream_sid = message.get("streamSid")
                 if not call_sid or not stream_sid:
-                    logger.error("Missing callSid or streamSid", message=message)
+                    logger.error("Missing callSid or streamSid", message=message, call_sid=call_sid)
                     continue
                 CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
                 logger.info("Connected", call_sid=call_sid, stream_sid=stream_sid)
                 continue
 
             elif event_type == "start":
-                logger.info("Stream started", stream_sid=message.get("streamSid"))
+                logger.info("Stream started", stream_sid=message.get("streamSid"), call_sid=call_sid)
                 continue
 
             elif event_type == "media":
@@ -404,7 +412,7 @@ async def relay_websocket(websocket: WebSocket):
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        if not closed and websocket.client_state == 1:  # 1 = CONNECTED
+        if not closed and websocket.client_state == 1:
             try:
                 await websocket.send_text(json.dumps({
                     "event": "stop",
@@ -430,7 +438,7 @@ async def relay_websocket(websocket: WebSocket):
 
 
 
-#works for english
+
 # import os
 # import logging
 # from typing import Dict, Any
