@@ -12,7 +12,7 @@ import json
 import asyncio
 import google.generativeai as genai
 
-# ---- Config ----
+
 load_dotenv()
 
 app = FastAPI()
@@ -32,7 +32,7 @@ for var in required_vars:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("MODwEL", "gemini-2.5-flash")
 VOICE_ID = os.getenv("VOICE_ID")
 SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
