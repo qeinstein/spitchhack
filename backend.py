@@ -3,15 +3,15 @@ import logging
 from typing import Dict, Any
 from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
-from fastapi import WebSocket
-from twilio.twiml.voice_response import VoiceResponse, Start, Stream
+from twilio.twiml.voice_response import VoiceResponse
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
 from spitch import Spitch
-from openai import AsyncOpenAI
+import google.generativeai as genai
 from urllib.parse import urlparse
 import json
 import asyncio
+import base64
 
 # ---- Config ----
 load_dotenv()
@@ -21,7 +21,7 @@ app = FastAPI()
 # Validate environment variables
 required_vars = [
     "SPITCH_API_KEY",
-    "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY",  # NEW: Gemini API key
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "BASE_URL",
@@ -32,17 +32,17 @@ for var in required_vars:
         raise RuntimeError(f"Missing environment variable: {var}")
 
 SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
-# VOICE_ID no longer needed; using Spitch voices directly
+MODEL = os.getenv("MODEL", "gemini-1.5-flash")  # Default to gemini-1.5-flash
 SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Clients ----
 try:
     spitch_client = Spitch(api_key=SPITCH_API_KEY)
-    openrouter_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_client = genai.GenerativeModel(MODEL)
 except Exception as e:
     raise RuntimeError(f"Failed to initialize clients: {e}")
 
@@ -65,25 +65,30 @@ CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {"role": str, "
 
 # ---- Helpers ----
 def spitch_translate(text: str, source: str, target: str) -> str:
-    """
-    Translate `text` from `source` language to `target` using Spitch API.
-    """
     try:
         resp = spitch_client.text.translate(text=text, source=source, target=target)
         t = getattr(resp, "text", None)
         if not t:
             raise RuntimeError("Empty translation from Spitch")
+        logger.info(f"Translated {source} -> {target}: {t[:50]}...")
         return t
     except Exception as e:
         logger.error(f"Spitch translation failed: {e}")
         raise RuntimeError(f"Translation error: {e}")
 
-async def openrouter_chat_reply(messages: list) -> str:  # Made async for consistency
+async def gemini_chat_reply(messages: list) -> str:
     try:
-        resp = await openrouter_client.chat.completions.create(model=MODEL, messages=messages)
-        return resp.choices[0].message.content
+        # Convert messages to Gemini format (system prompt + chat history)
+        prompt = SYSTEM_PROMPT + "\n\n" + "\n".join(
+            f"{msg['role'].capitalize()}: {msg['content']}" for msg in messages
+        )
+        response = await gemini_client.generate_content_async(prompt)
+        if not response.text:
+            raise RuntimeError("Empty response from Gemini")
+        logger.info(f"Gemini reply: {response.text[:50]}...")
+        return response.text
     except Exception as e:
-        logger.error(f"OpenRouter API error: {e}")
+        logger.error(f"Gemini API error: {e}")
         return "Sorry, I couldn't process your request. Please try again."
 
 # ---- Root endpoint ----
@@ -94,7 +99,6 @@ async def root():
 # ---- TwiML entry ----
 @app.post("/voice")
 async def voice_entry(request: Request):
-    # Validate Twilio webhook
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -102,7 +106,6 @@ async def voice_entry(request: Request):
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     twiml = VoiceResponse()
-    # Gather language selection
     gather = twiml.gather(
         num_digits=1,
         action="/process_language",
@@ -110,9 +113,7 @@ async def voice_entry(request: Request):
         timeout=8
     )
     gather.say("Welcome to Proxy. For Yoruba press 1. For Igbo press 2. For Hausa press 3. For English press 4.")
-    # If gather doesn't get input:
     twiml.redirect("/process_language_fallback")
-
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_language_fallback")
@@ -124,7 +125,6 @@ async def process_language_fallback(request: Request):
 
 @app.post("/process_language")
 async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
-    # Validate Twilio webhook
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -145,7 +145,6 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
     )
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
-
     connect = twiml.connect()
     conversation_relay = connect.conversation_relay(
         url=f"wss://{urlparse(BASE_URL).netloc}/relay",
@@ -153,55 +152,48 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         report_input_during_agent_speech="any",
         debug="speaker-events"
     )
-    # FIXED: Removed tts_provider="elevenlabs" to avoid overriding with non-native voices.
-    # Now relies fully on WebSocket streaming of Spitch audio.
-    # Kept language for transcription only.
-    language = conversation_relay.language(
+    conversation_relay.language(
         code=lang_code_twiml,
-        # tts_provider omitted (Twilio default, but we bypass with stream)
-        # voice omitted (not needed for stream)
-        transcription_provider="google"  # Google handles Yoruba/Igbo/Hausa well
+        transcription_provider="google"
     )
-
     return Response(content=str(twiml), media_type="application/xml")
 
 # ---- Health check ----
 @app.get("/health")
 async def health():
     status = {"status": "ok", "services": {}}
-    # Test Spitch translate
     try:
         _ = spitch_translate("test", "en", "en")
         status["services"]["spitch"] = "ok"
     except Exception as e:
         status["services"]["spitch"] = f"down: {e}"
-    # Test OpenRouter
     try:
-        _ = await openrouter_chat_reply([{"role": "system", "content": "test"}])
-        status["services"]["openrouter"] = "ok"
+        _ = await gemini_chat_reply([{"role": "system", "content": "test"}])
+        status["services"]["gemini"] = "ok"
     except Exception as e:
-        status["services"]["openrouter"] = f"down: {e}"
+        status["services"]["gemini"] = f"down: {e}"
     return status
 
 @app.websocket("/relay")
 async def relay_websocket(websocket: WebSocket):
     await websocket.accept()
     call_sid = None
+    stream_sid = None
     message_queue = asyncio.Queue()
     interrupted = False
     current_response_task = None
+    closed = False
 
-    # UPDATED: Real Spitch voices (from docs: Aramide/Kayode for Yoruba, Emeka/Chisom for Igbo, Hauwa/Danjuma for Hausa, jude for English)
-    # Picked one per language; swap for variety (e.g., female/male).
+    # Spitch voices (from https://spitch.app/)
     VOICES = {
-        "yo": "kayode",    # Yoruba (male, native-sounding)
-        "ig": "emeka",     # Igbo (male)
-        "ha": "danjuma",   # Hausa (male)
-        "en": "jude"       # English (keep your existing)
+        "yo": "kayode",    # Yoruba
+        "ig": "emeka",     # Igbo
+        "ha": "danjuma",   # Hausa
+        "en": "jude"       # English
     }
 
     async def receiver():
-        while True:
+        while not closed:
             try:
                 data = await websocket.receive_text()
                 await message_queue.put(json.loads(data))
@@ -216,63 +208,70 @@ async def relay_websocket(websocket: WebSocket):
     receive_task = asyncio.create_task(receiver())
 
     try:
-        while True:
+        while not closed:
             message = await message_queue.get()
             if message is None:
                 break
 
-            event_type = message.get("type")
+            event_type = message.get("event")
             logger.debug("WebSocket event: %s", message)
 
-            if event_type == "setup":
+            if event_type == "connected":
                 call_sid = message.get("callSid")
-                if not call_sid:
-                    logger.error("Missing callSid in setup")
+                stream_sid = message.get("streamSid")
+                if not call_sid or not stream_sid:
+                    logger.error("Missing callSid or streamSid in connected event")
                     continue
                 CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
-                logger.info("Setup for CallSid %s", call_sid)
+                logger.info("Connected for CallSid %s, StreamSid %s", call_sid, stream_sid)
                 continue
 
-            elif event_type == "prompt":
-                user_text = message.get("voicePrompt")  # This is already transcribed in user's language by Twilio/Google
+            elif event_type == "start":
+                logger.info("Stream started: %s", message.get("streamSid"))
+                continue
+
+            elif event_type == "media":
+                user_text = message.get("media", {}).get("payload")
                 if not user_text or not user_text.strip():
-                    logger.error("Missing or empty voicePrompt")
+                    logger.error("Missing or empty media payload")
                     continue
 
                 _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
-                logger.info(f"Processing prompt in {lang_spitch}: {user_text[:50]}...")  # Debug log
+                logger.info(f"Processing prompt in {lang_spitch}: {user_text[:50]}...")
 
                 try:
+                    # Decode base64 if needed (Twilio sends text, but future-proof)
+                    if lang_spitch != "en":
+                        try:
+                            user_text = base64.b64decode(user_text).decode("utf-8")
+                        except Exception:
+                            pass  # Assume already text
+
                     # Translate input → English
                     if lang_spitch != "en":
                         english_text = spitch_translate(user_text, source=lang_spitch, target="en")
-                        logger.info(f"Translated to English: {english_text[:50]}...")
                     else:
                         english_text = user_text
 
                     history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
                     history.append({"role": "user", "content": english_text})
 
-                    # reset interrupted for new response
                     interrupted = False
 
                     async def process_response():
                         nonlocal interrupted, history
-                        reply_en = ""
-
                         try:
-                            # get final LLM response in English
-                            reply_en = await openrouter_chat_reply(history)
-                            logger.info(f"LLM reply (EN): {reply_en[:50]}...")
+                            # Get LLM response
+                            reply_en = await gemini_chat_reply(history)
+                            logger.info(f"Gemini reply (EN): {reply_en[:50]}...")
 
                             # Translate back to user language
                             if lang_spitch != "en":
                                 reply_local = spitch_translate(reply_en, source="en", target=lang_spitch)
-                                logger.info(f"Translated to local: {reply_local[:50]}...")
                             else:
                                 reply_local = reply_en
 
-                            # TTS via Spitch (native African voices)
+                            # TTS via Spitch
                             voice_id = VOICES.get(lang_spitch, VOICES["en"])
                             logger.info(f"Generating Spitch audio: lang={lang_spitch}, voice={voice_id}, text={reply_local[:50]}...")
                             audio_resp = spitch_client.speech.generate(
@@ -281,76 +280,88 @@ async def relay_websocket(websocket: WebSocket):
                                 voice=voice_id
                             )
 
-                            # Check if audio_resp is empty
                             audio_data = audio_resp.read()
                             if not audio_data:
                                 raise RuntimeError("Spitch returned empty audio")
 
-                            # Stream audio back to Twilio (simulate streaming with chunks)
-                            chunk_size = 4096  # UPDATED: Better alignment for audio bytes
+                            # Stream audio to Twilio
+                            chunk_size = 4096
                             offset = 0
                             total_len = len(audio_data)
                             logger.info(f"Streaming {total_len} bytes of Spitch audio")
 
-                            while offset < total_len:
+                            while offset < total_len and not interrupted:
                                 chunk = audio_data[offset:offset + chunk_size]
-                                await websocket.send_bytes(chunk)
+                                encoded_chunk = base64.b64encode(chunk).decode("utf-8")
+                                await websocket.send_text(json.dumps({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": encoded_chunk}
+                                }))
                                 offset += chunk_size
-                                await asyncio.sleep(0.01)  # Small delay to simulate real-time
+                                await asyncio.sleep(0.01)
 
-                            # End of stream marker
-                            await websocket.send_text(json.dumps({
-                                "type": "audio",
-                                "last": True
-                            }))
-                            logger.info("Spitch audio stream complete")
+                            if not interrupted:
+                                await websocket.send_text(json.dumps({
+                                    "event": "mark",
+                                    "streamSid": stream_sid,
+                                    "mark": {"name": "end"}
+                                }))
+                                logger.info("Spitch audio stream complete")
 
-                            # Save history
                             history.append({"role": "assistant", "content": reply_en})
                             CONVERSATION_HISTORY[call_sid] = history[-20:]
 
                         except Exception as e:
                             logger.error(f"Error in process_response: {e}")
                             if not interrupted:
-                                # Fallback: Send text (Twilio will TTS it, but at least something plays)
+                                audio_data = spitch_client.speech.generate(
+                                    text="Sorry, an error occurred. Please try again.",
+                                    language="en",
+                                    voice=VOICES["en"]
+                                ).read()
                                 await websocket.send_text(json.dumps({
-                                    "type": "text",
-                                    "token": "Sorry, an error occurred. Please try again.",
-                                    "last": True
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": base64.b64encode(audio_data).decode("utf-8")}
+                                }))
+                                await websocket.send_text(json.dumps({
+                                    "event": "mark",
+                                    "streamSid": stream_sid,
+                                    "mark": {"name": "end"}
                                 }))
 
                     current_response_task = asyncio.create_task(process_response())
 
                 except Exception as e:
                     logger.error(f"Error processing prompt: {e}")
-                    await websocket.send_text(json.dumps({
-                        "type": "text",
-                        "token": "Sorry, an error occurred. Please try again.",
-                        "last": True
-                    }))
+                    if not interrupted:
+                        audio_data = spitch_client.speech.generate(
+                            text="Sorry, an error occurred. Please try again.",
+                            language="en",
+                            voice=VOICES["en"]
+                        ).read()
+                        await websocket.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": base64.b64encode(audio_data).decode("utf-8")}
+                        }))
+                        await websocket.send_text(json.dumps({
+                            "event": "mark",
+                            "streamSid": stream_sid,
+                            "mark": {"name": "end"}
+                        }))
                 continue
 
-            elif event_type == "speaker":
-                if message.get("event") == "clientSpeaking":
-                    logger.info("Client speaking detected - potential interruption")
-                    interrupted = True
+            elif event_type == "stop":
+                logger.info("Stream stopped: %s", message.get("streamSid"))
+                break
+
+            elif event_type == "info":
+                logger.info("Info event received: %s", message)
                 continue
 
-            elif event_type == "dtmf":
-                logger.info("DTMF received: %s", message)
-                continue
-
-            elif event_type == "error":
-                logger.error("Error received: %s", message)
-                continue
-
-            elif event_type == "call_ended":
-                LANGUAGE_SELECTION.pop(call_sid, None)
-                CONVERSATION_HISTORY.pop(call_sid, None)
-                logger.info("Cleaned up for CallSid %s", call_sid)
-                continue
-
-            logger.warning("Unknown event type: %s", event_type)
+            logger.warning("Unknown event: %s", event_type)
 
     except Exception as e:
         logger.error("WebSocket error: %s", e)
@@ -359,9 +370,18 @@ async def relay_websocket(websocket: WebSocket):
             current_response_task.cancel()
         receive_task.cancel()
         if call_sid:
-            LANGUAGE_SELECTION.pop(call_sid, None) 
+            LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        await websocket.close()
+        if not closed:
+            try:
+                await websocket.send_text(json.dumps({
+                    "event": "stop",
+                    "streamSid": stream_sid
+                }))
+                await websocket.close()
+                closed = True
+            except Exception as e:
+                logger.error(f"Error closing WebSocket: {e}")
 
 
 
