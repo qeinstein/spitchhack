@@ -317,7 +317,10 @@ async def relay_websocket(websocket: WebSocket):
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        await websocket.close()
+        
+        # Only close if the connection is still open
+        if websocket.client_state.name == "CONNECTED":
+            await websocket.close()
 
 
 
