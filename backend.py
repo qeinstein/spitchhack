@@ -1,13 +1,13 @@
 import os
 import logging
-from typing import Dict, Any
-from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
+from typing import Dict
+from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Start, Stream
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
-from spitch import Spitch
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from urllib.parse import urlparse
 import json
 import asyncio
@@ -19,30 +19,27 @@ app = FastAPI()
 
 # Validate environment variables
 required_vars = [
-    "SPITCH_API_KEY",
     "GEMINI_API_KEY",
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "BASE_URL",
-    "VOICE_ID"
+    "CONVERSATION_SERVICE_SID"
 ]
 for var in required_vars:
     if not os.getenv(var):
         raise RuntimeError(f"Missing environment variable: {var}")
 
-SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 VOICE_ID = os.getenv("VOICE_ID")
-SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice. Answer carefully, in the user's language. Spell out all numbers, for example twenty not 20. Do not use emojis, bullets, or special symbols."
+SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
 
 # ---- Clients ----
 try:
-    spitch_client = Spitch(api_key=SPITCH_API_KEY)
-    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
-    raise RuntimeError(f"Failed to initialize clients: {e}")
+    raise RuntimeError(f"Failed to initialize Gemini client: {e}")
 
 # ---- App setup ----
 logging.basicConfig(level=logging.INFO)
@@ -57,40 +54,44 @@ LANGUAGE_MAP = {
     "4": ("English", "en-US", "en")
 }
 
-LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, lang_code_spitch)
-CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {"role": str, "content": str}
+LANGUAGE_SELECTION: Dict[str, tuple] = {}
+CONVERSATION_HISTORY: Dict[str, list] = {}
 
 # ---- Helpers ----
-def spitch_translate(text: str, source: str, target: str) -> str:
+def gemini_translate(text: str, target: str) -> str:
+    """
+    Translate `text` to `target` language using Gemini API.
+    """
     try:
-        resp = spitch_client.text.translate(text=text, source=source, target=target)
-        t = getattr(resp, "text", None)
-        if not t:
-            raise RuntimeError("Empty translation from Spitch")
-        return t
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[f"Translate this to {target}: {text}"]
+        )
+        return response.text.strip()
     except Exception as e:
-        logger.error(f"Spitch translation failed: {e}")
+        logger.error(f"Gemini translation failed: {e}")
         raise RuntimeError(f"Translation error: {e}")
 
-async def gemini_chat_reply(messages: list) -> str:
+def gemini_chat_reply(messages: list) -> str:
     try:
-        resp = await genai.chat.completions.create(
-            model="chat-bison-001",
-            messages=messages
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[msg["content"] for msg in messages]
         )
-        return resp.candidates[0].content
+        return response.text.strip()
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error(f"Gemini chat reply failed: {e}")
         return "Sorry, I couldn't process your request. Please try again."
 
 # ---- Root endpoint ----
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the SpitchHack Voice Relay API. Use /health to check status."}
+    return {"message": "Welcome to the Proxy Voice Relay API. Use /health to check status."}
 
 # ---- TwiML entry ----
 @app.post("/voice")
 async def voice_entry(request: Request):
+    # Validate Twilio webhook
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -118,6 +119,7 @@ async def process_language_fallback(request: Request):
 
 @app.post("/process_language")
 async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
+    # Validate Twilio webhook
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -157,12 +159,10 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
 async def health():
     status = {"status": "ok", "services": {}}
     try:
-        _ = spitch_translate("test", "en", "en")
-        status["services"]["spitch"] = "ok"
-    except Exception as e:
-        status["services"]["spitch"] = f"down: {e}"
-    try:
-        await gemini_chat_reply([{"role": "system", "content": "test"}])
+        _ = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=["test"]
+        )
         status["services"]["gemini"] = "ok"
     except Exception as e:
         status["services"]["gemini"] = f"down: {e}"
@@ -222,46 +222,38 @@ async def relay_websocket(websocket: WebSocket):
                 _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
 
                 try:
-                    # Translate to English if needed for Gemini (optional, Gemini supports multiple languages too)
+                    english_text = user_text
+
                     history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
-                    history.append({"role": "user", "content": user_text})
+                    history.append({"role": "user", "content": english_text})
 
                     interrupted = False
 
                     async def stream_response():
                         nonlocal interrupted, history
-                        reply_user_lang = ""
+                        reply_en = ""
                         try:
-                            stream = await genai.chat.completions.create(
-                                model="chat-bison-001",
-                                messages=history,
-                                stream=True
+                            response = gemini_client.models.generate_content(
+                                model="gemini-2.5-flash",
+                                contents=[msg["content"] for msg in history]
                             )
-                            async for chunk in stream:
-                                if interrupted:
-                                    logger.info("Response interrupted")
-                                    break
-                                delta = chunk.candidates[0].content or ""
-                                if delta:
-                                    reply_user_lang += delta
-                                    await websocket.send_text(
-                                        json.dumps({
-                                            "type": "text",
-                                            "token": delta,
-                                            "last": False,
-                                            "interruptible": True
-                                        })
-                                    )
-                            if not interrupted:
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "text",
-                                        "token": "",
-                                        "last": True
-                                    })
-                                )
-                                history.append({"role": "assistant", "content": reply_user_lang})
-                                CONVERSATION_HISTORY[call_sid] = history[-20:]
+                            reply_en = response.text.strip()
+
+                            if lang_spitch != "en":
+                                reply_local = gemini_translate(reply_en, lang_spitch)
+                            else:
+                                reply_local = reply_en
+
+                            await websocket.send_text(
+                                json.dumps({
+                                    "type": "text",
+                                    "token": reply_local,
+                                    "last": True
+                                })
+                            )
+
+                            history.append({"role": "assistant", "content": reply_en})
+                            CONVERSATION_HISTORY[call_sid] = history[-20:]
                         except Exception as e:
                             logger.error(f"Error in stream_response: {e}")
                             if not interrupted:
@@ -300,29 +292,9 @@ async def relay_websocket(websocket: WebSocket):
                 logger.error("Error received: %s", message)
                 continue
 
-            elif event_type == "call_ended":
-                LANGUAGE_SELECTION.pop(call_sid, None)
-                CONVERSATION_HISTORY.pop(call_sid, None)
-                logger.info("Cleaned up for CallSid %s", call_sid)
-                continue
-
-            logger.warning("Unknown event type: %s", event_type)
-
-    except Exception as e:
-        logger.error("WebSocket error: %s", e)
-    finally:
-        if current_response_task:
-            current_response_task.cancel()
-        receive_task.cancel()
-        if call_sid:
-            LANGUAGE_SELECTION.pop(call_sid, None)
-            CONVERSATION_HISTORY.pop(call_sid, None)
-        await websocket.close()
-
-
-
-
-
+            elif event_type
+::contentReference[oaicite:0]{index=0}
+ 
 
 
 
