@@ -1,5 +1,6 @@
 import os
 import logging
+import structlog
 from typing import Dict, Any
 from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -21,7 +22,7 @@ app = FastAPI()
 # Validate environment variables
 required_vars = [
     "SPITCH_API_KEY",
-    "GEMINI_API_KEY",  # NEW: Gemini API key
+    "GEMINI_API_KEY",
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
     "BASE_URL",
@@ -35,8 +36,23 @@ SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODEL", "gemini-2.5-flash")  # Default to gemini-1.5-flash
-SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+MODEL = os.getenv("MODEL", "gemini-2.5-flash")
+SYSTEM_PROMPT = "You are a helpful assistant named Proxy.Respond Like a normal human. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+
+# ---- Logging Setup ----
+logging.basicConfig(level=logging.INFO)
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.stdlib.add_log_level,
+        structlog.processors.JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+logger = structlog.get_logger("conversation-relay")
 
 # ---- Clients ----
 try:
@@ -44,24 +60,19 @@ try:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_client = genai.GenerativeModel(MODEL)
 except Exception as e:
+    logger.error("Failed to initialize clients", error=str(e))
     raise RuntimeError(f"Failed to initialize clients: {e}")
-
-# ---- App setup ----
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("conversation-relay")
-app = FastAPI()
-twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 
 # ---- Language map ----
 LANGUAGE_MAP = {
-    "1": ("Yoruba", "yo-NG", "yo"),  # (lang_name, twilio_bcp47, spitch_code)
+    "1": ("Yoruba", "yo-NG", "yo"),
     "2": ("Igbo", "ig-NG", "ig"),
     "3": ("Hausa", "ha-NG", "ha"),
     "4": ("English", "en-US", "en")
 }
 
-LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, lang_code_spitch)
-CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {"role": str, "content": str}
+LANGUAGE_SELECTION: Dict[str, tuple] = {}
+CONVERSATION_HISTORY: Dict[str, list] = {}
 
 # ---- Helpers ----
 def spitch_translate(text: str, source: str, target: str) -> str:
@@ -70,25 +81,24 @@ def spitch_translate(text: str, source: str, target: str) -> str:
         t = getattr(resp, "text", None)
         if not t:
             raise RuntimeError("Empty translation from Spitch")
-        logger.info(f"Translated {source} -> {target}: {t[:50]}...")
+        logger.info("Translation successful", source=source, target=target, text_preview=t[:50])
         return t
     except Exception as e:
-        logger.error(f"Spitch translation failed: {e}")
+        logger.error("Spitch translation failed", source=source, target=target, error=str(e))
         raise RuntimeError(f"Translation error: {e}")
 
 async def gemini_chat_reply(messages: list) -> str:
     try:
-        # Convert messages to Gemini format (system prompt + chat history)
         prompt = SYSTEM_PROMPT + "\n\n" + "\n".join(
             f"{msg['role'].capitalize()}: {msg['content']}" for msg in messages
         )
         response = await gemini_client.generate_content_async(prompt)
         if not response.text:
             raise RuntimeError("Empty response from Gemini")
-        logger.info(f"Gemini reply: {response.text[:50]}...")
+        logger.info("Gemini reply generated", reply_preview=response.text[:50])
         return response.text
     except Exception as e:
-        logger.error(f"Gemini API error: {e}")
+        logger.error("Gemini API error", error=str(e))
         return "Sorry, I couldn't process your request. Please try again."
 
 # ---- Root endpoint ----
@@ -103,6 +113,7 @@ async def voice_entry(request: Request):
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
     if not twilio_validator.validate(url, dict(form_data), signature):
+        logger.error("Invalid Twilio signature", url=url)
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     twiml = VoiceResponse()
@@ -114,6 +125,7 @@ async def voice_entry(request: Request):
     )
     gather.say("Welcome to Proxy. For Yoruba press 1. For Igbo press 2. For Hausa press 3. For English press 4.")
     twiml.redirect("/process_language_fallback")
+    logger.info("Voice endpoint called", url=url)
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_language_fallback")
@@ -121,6 +133,7 @@ async def process_language_fallback(request: Request):
     twiml = VoiceResponse()
     twiml.say("Sorry, we did not receive input. Redirecting you back to language selection.")
     twiml.redirect("/voice")
+    logger.info("Language selection fallback triggered")
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_language")
@@ -129,19 +142,24 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
     if not twilio_validator.validate(url, dict(form_data), signature):
+        logger.error("Invalid Twilio signature", url=url)
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     twiml = VoiceResponse()
     if not (Digits and CallSid and Digits in LANGUAGE_MAP):
         twiml.say("Invalid selection or call ID. Please try again.")
         twiml.redirect("/voice")
+        logger.error("Invalid language selection", digits=Digits, call_sid=CallSid)
         return Response(content=str(twiml), media_type="application/xml")
 
     lang_name, lang_code_twiml, lang_code_spitch = LANGUAGE_MAP[Digits]
     LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
     logger.info(
-        "Language set for CallSid %s -> %s (Twilio code: %s, Spitch code: %s)",
-        CallSid, lang_name, lang_code_twiml, lang_code_spitch
+        "Language set",
+        call_sid=CallSid,
+        language=lang_name,
+        twilio_code=lang_code_twiml,
+        spitch_code=lang_code_spitch
     )
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
@@ -167,11 +185,14 @@ async def health():
         status["services"]["spitch"] = "ok"
     except Exception as e:
         status["services"]["spitch"] = f"down: {e}"
+        logger.error("Spitch health check failed", error=str(e))
     try:
         _ = await gemini_chat_reply([{"role": "system", "content": "test"}])
         status["services"]["gemini"] = "ok"
     except Exception as e:
         status["services"]["gemini"] = f"down: {e}"
+        logger.error("Gemini health check failed", error=str(e))
+    logger.info("Health check completed", status=status)
     return status
 
 @app.websocket("/relay")
@@ -184,24 +205,30 @@ async def relay_websocket(websocket: WebSocket):
     current_response_task = None
     closed = False
 
-    # Spitch voices (from https://spitch.app/)
     VOICES = {
-        "yo": "kayode",    # Yoruba
-        "ig": "emeka",     # Igbo
-        "ha": "danjuma",   # Hausa
-        "en": "jude"       # English
+        "yo": "kayode",
+        "ig": "emeka",
+        "ha": "danjuma",
+        "en": "jude"
     }
 
     async def receiver():
         while not closed:
             try:
                 data = await websocket.receive_text()
-                await message_queue.put(json.loads(data))
+                try:
+                    parsed = json.loads(data)
+                    await message_queue.put(parsed)
+                    logger.debug("WebSocket message received", raw_message=parsed)
+                except json.JSONDecodeError:
+                    logger.warning("Invalid JSON received", raw_data=data)
+                    await message_queue.put(None)
             except WebSocketDisconnect:
+                logger.info("WebSocket disconnected", call_sid=call_sid)
                 await message_queue.put(None)
                 break
             except Exception as e:
-                logger.error(f"Receiver error: {e}")
+                logger.error("Receiver error", error=str(e), call_sid=call_sid)
                 await message_queue.put(None)
                 break
 
@@ -211,43 +238,47 @@ async def relay_websocket(websocket: WebSocket):
         while not closed:
             message = await message_queue.get()
             if message is None:
+                logger.info("Null message received, closing", call_sid=call_sid)
                 break
 
             event_type = message.get("event")
-            logger.debug("WebSocket event: %s", message)
+            if not event_type:
+                logger.warning("Unknown event received", raw_message=message, call_sid=call_sid)
+                continue
+
+            logger.debug("Processing WebSocket event", event_type=event_type, call_sid=call_sid)
 
             if event_type == "connected":
                 call_sid = message.get("callSid")
                 stream_sid = message.get("streamSid")
                 if not call_sid or not stream_sid:
-                    logger.error("Missing callSid or streamSid in connected event")
+                    logger.error("Missing callSid or streamSid", message=message)
                     continue
                 CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
-                logger.info("Connected for CallSid %s, StreamSid %s", call_sid, stream_sid)
+                logger.info("Connected", call_sid=call_sid, stream_sid=stream_sid)
                 continue
 
             elif event_type == "start":
-                logger.info("Stream started: %s", message.get("streamSid"))
+                logger.info("Stream started", stream_sid=message.get("streamSid"))
                 continue
 
             elif event_type == "media":
                 user_text = message.get("media", {}).get("payload")
                 if not user_text or not user_text.strip():
-                    logger.error("Missing or empty media payload")
+                    logger.error("Missing or empty media payload", call_sid=call_sid)
                     continue
 
                 _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
-                logger.info(f"Processing prompt in {lang_spitch}: {user_text[:50]}...")
+                logger.info("Processing prompt", language=lang_spitch, text_preview=user_text[:50], call_sid=call_sid)
 
                 try:
-                    # Decode base64 if needed (Twilio sends text, but future-proof)
                     if lang_spitch != "en":
                         try:
                             user_text = base64.b64decode(user_text).decode("utf-8")
+                            logger.info("Decoded base64 input", decoded_preview=user_text[:50], call_sid=call_sid)
                         except Exception:
-                            pass  # Assume already text
+                            pass
 
-                    # Translate input → English
                     if lang_spitch != "en":
                         english_text = spitch_translate(user_text, source=lang_spitch, target="en")
                     else:
@@ -261,19 +292,21 @@ async def relay_websocket(websocket: WebSocket):
                     async def process_response():
                         nonlocal interrupted, history
                         try:
-                            # Get LLM response
                             reply_en = await gemini_chat_reply(history)
-                            logger.info(f"Gemini reply (EN): {reply_en[:50]}...")
 
-                            # Translate back to user language
                             if lang_spitch != "en":
                                 reply_local = spitch_translate(reply_en, source="en", target=lang_spitch)
                             else:
                                 reply_local = reply_en
 
-                            # TTS via Spitch
                             voice_id = VOICES.get(lang_spitch, VOICES["en"])
-                            logger.info(f"Generating Spitch audio: lang={lang_spitch}, voice={voice_id}, text={reply_local[:50]}...")
+                            logger.info(
+                                "Generating Spitch audio",
+                                language=lang_spitch,
+                                voice=voice_id,
+                                text_preview=reply_local[:50],
+                                call_sid=call_sid
+                            )
                             audio_resp = spitch_client.speech.generate(
                                 text=reply_local,
                                 language=lang_spitch,
@@ -284,11 +317,10 @@ async def relay_websocket(websocket: WebSocket):
                             if not audio_data:
                                 raise RuntimeError("Spitch returned empty audio")
 
-                            # Stream audio to Twilio
                             chunk_size = 4096
                             offset = 0
                             total_len = len(audio_data)
-                            logger.info(f"Streaming {total_len} bytes of Spitch audio")
+                            logger.info("Streaming audio", total_bytes=total_len, call_sid=call_sid)
 
                             while offset < total_len and not interrupted:
                                 chunk = audio_data[offset:offset + chunk_size]
@@ -307,13 +339,13 @@ async def relay_websocket(websocket: WebSocket):
                                     "streamSid": stream_sid,
                                     "mark": {"name": "end"}
                                 }))
-                                logger.info("Spitch audio stream complete")
+                                logger.info("Audio stream complete", call_sid=call_sid)
 
                             history.append({"role": "assistant", "content": reply_en})
                             CONVERSATION_HISTORY[call_sid] = history[-20:]
 
                         except Exception as e:
-                            logger.error(f"Error in process_response: {e}")
+                            logger.error("Error in process_response", error=str(e), call_sid=call_sid)
                             if not interrupted:
                                 audio_data = spitch_client.speech.generate(
                                     text="Sorry, an error occurred. Please try again.",
@@ -334,7 +366,7 @@ async def relay_websocket(websocket: WebSocket):
                     current_response_task = asyncio.create_task(process_response())
 
                 except Exception as e:
-                    logger.error(f"Error processing prompt: {e}")
+                    logger.error("Error processing prompt", error=str(e), call_sid=call_sid)
                     if not interrupted:
                         audio_data = spitch_client.speech.generate(
                             text="Sorry, an error occurred. Please try again.",
@@ -354,17 +386,17 @@ async def relay_websocket(websocket: WebSocket):
                 continue
 
             elif event_type == "stop":
-                logger.info("Stream stopped: %s", message.get("streamSid"))
+                logger.info("Stream stopped", stream_sid=message.get("streamSid"), call_sid=call_sid)
                 break
 
             elif event_type == "info":
-                logger.info("Info event received: %s", message)
+                logger.info("Info event received", message=message, call_sid=call_sid)
                 continue
 
-            logger.warning("Unknown event: %s", event_type)
+            logger.warning("Unknown event type", event_type=event_type, message=message, call_sid=call_sid)
 
     except Exception as e:
-        logger.error("WebSocket error: %s", e)
+        logger.error("WebSocket error", error=str(e), call_sid=call_sid)
     finally:
         if current_response_task:
             current_response_task.cancel()
@@ -372,7 +404,7 @@ async def relay_websocket(websocket: WebSocket):
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        if not closed:
+        if not closed and websocket.client_state == 1:  # 1 = CONNECTED
             try:
                 await websocket.send_text(json.dumps({
                     "event": "stop",
@@ -380,8 +412,9 @@ async def relay_websocket(websocket: WebSocket):
                 }))
                 await websocket.close()
                 closed = True
+                logger.info("WebSocket closed cleanly", call_sid=call_sid)
             except Exception as e:
-                logger.error(f"Error closing WebSocket: {e}")
+                logger.error("Error closing WebSocket", error=str(e), call_sid=call_sid)
 
 
 
@@ -397,7 +430,7 @@ async def relay_websocket(websocket: WebSocket):
 
 
 
-
+#works for english
 # import os
 # import logging
 # from typing import Dict, Any
