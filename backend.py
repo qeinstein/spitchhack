@@ -147,7 +147,10 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
 
     lang_name, lang_code_twiml, lang_code_spitch = LANGUAGE_MAP[Digits]
     LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
-    logger.info("Language set for CallSid %s -> %s", CallSid, lang_name, lang_code_twiml, lang_code_spitch)
+    logger.info(
+        "Language set for CallSid %s -> %s (Twilio code: %s, Spitch code: %s)",
+        CallSid, lang_name, lang_code_twiml, lang_code_spitch
+    )
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
 
