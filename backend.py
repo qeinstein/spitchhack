@@ -16,8 +16,6 @@ from urllib.parse import urlparse
 # ---- Config ----
 load_dotenv()
 
-app= FastAPI()
-
 # Validate environment variables
 required_vars = [
     "SPITCH_API_KEY",
@@ -201,15 +199,16 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         twiml.redirect("/voice")
         return Response(content=str(twiml), media_type="application/xml")
 
-    lang_name, _, lang_code_spitch = LANGUAGE_MAP[Digits]
-    LANGUAGE_SELECTION[CallSid] = (lang_name, "en-US", lang_code_spitch)
+    lang_name, _, lang_spitch = LANGUAGE_MAP[Digits]
+    LANGUAGE_SELECTION[CallSid] = (lang_name, "en-US", lang_spitch)
     logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
     
     twiml.say(f"You selected {lang_name}. Please say something after the tone.")
     twiml.pause(length=1)
 
     connect = twiml.connect()
-    connect.stream(url=f"wss://{BASE_URL.replace('https://', '')}/stream/{CallSid}")
+    # Use a raw stream to send audio for Google Cloud STT
+    connect.stream(url=f"wss://{urlparse(BASE_URL).netloc}/stream/{CallSid}")
 
     return Response(content=str(twiml), media_type="application/xml")
 
