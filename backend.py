@@ -17,6 +17,8 @@ import asyncio
 # ---- Config ----
 load_dotenv()
 
+app = FastAPI()
+
 # Validate environment variables
 required_vars = [
     "SPITCH_API_KEY",
@@ -223,11 +225,14 @@ async def health():
 
 @app.websocket("/relay")
 async def relay_websocket(websocket: WebSocket):
+    logger.info("started rrelay endpoint")
     await websocket.accept()
     call_sid = None
     message_queue = asyncio.Queue()
     interrupted = False
     current_response_task = None
+    logger.info("finished started rrelay endpoint")
+
 
     async def receiver():
         while True:
@@ -243,6 +248,7 @@ async def relay_websocket(websocket: WebSocket):
                 break
 
     receive_task = asyncio.create_task(receiver())
+    logger.info("successfully received ")
 
     try:
         while True:
@@ -275,7 +281,7 @@ async def relay_websocket(websocket: WebSocket):
                     await asyncio.sleep(0)
 
                 _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
-                logger.debug("I got to the stage before translation to user's lang")
+                logger.info("I got to the stage before translation to user's lang")
 
                 try:
                     if lang_spitch != "en":
@@ -289,7 +295,7 @@ async def relay_websocket(websocket: WebSocket):
                     # Reset interrupted for new response
                     interrupted = False
 
-                    logger.debug("I successfully translated to english from users lang")
+                    logger.info("I successfully translated to english from users lang")
 
                     async def stream_response():
                         nonlocal interrupted, history
