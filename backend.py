@@ -10,7 +10,6 @@ from spitch import Spitch
 from openai import AsyncOpenAI
 from urllib.parse import urlparse
 import json
-import audioop
 import asyncio
 import base64
 from pydub import AudioSegment
@@ -104,19 +103,35 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
         raise RuntimeError(f"TTS error: {e}")
         
 def spitch_stt(audio_data: bytes, lang: str) -> str:
-    """Recognize speech from audio bytes using Spitch API."""
+    """
+    Recognize speech from audio bytes using Spitch API.
+    
+    This function now uses Pydub to handle the audio format conversion.
+    Twilio Media Streams send audio as raw mu-law at 8kHz, which Spitch 
+    might not accept directly. We convert it to WAV first.
+    """
     try:
-        # Spitch's recognize endpoint often expects a specific audio format.
-        # Twilio sends PCM mu-law 8khz, 1-channel. We need to convert it to a compatible format like WAV.
-        audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mulaw", frame_rate=8000, channels=1)
+        # Pydub can read raw mu-law data by specifying the format and parameters.
+        audio_segment = AudioSegment.from_file(
+            BytesIO(audio_data), 
+            format="raw", # Use 'raw' for uncompressed audio data
+            frame_rate=8000, 
+            channels=1, 
+            sample_width=1 # mu-law is 8-bit, so sample_width is 1
+        )
+        
+        # Now, export the raw data to a WAV format in memory, which is universally
+        # compatible with most ASR APIs like Spitch.
         wav_buffer = BytesIO()
         audio_segment.export(wav_buffer, format="wav")
         wav_buffer.seek(0)
         
+        # Use the WAV data to call the Spitch recognize endpoint
         resp = spitch_client.speech.recognize(
             file_data=wav_buffer,
             language=lang
         )
+        
         t = getattr(resp, "text", None)
         if not t:
             raise RuntimeError("Empty recognition from Spitch")
@@ -124,7 +139,6 @@ def spitch_stt(audio_data: bytes, lang: str) -> str:
     except Exception as e:
         logger.error(f"Spitch STT failed: {e}")
         raise RuntimeError(f"STT error: {e}")
-
 
 # ---- Root endpoint ----
 @app.get("/")
