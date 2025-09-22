@@ -1,46 +1,59 @@
 import os
 import logging
 import json
-import base64
-import time
 import uuid
-from typing import Dict, Any, Optional
-from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response, FileResponse
-from twilio.twiml.voice_response import VoiceResponse
-from twilio.request_validator import RequestValidator
-from dotenv import load_dotenv
 import asyncio
-import google.generativeai as genai
+from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse
-import httpx
+
+import requests
+from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect, Response
+from fastapi.responses import FileResponse
+from dotenv import load_dotenv
+import google.generativeai as genai
+from twilio.request_validator import RequestValidator
+from twilio.twiml.voice_response import VoiceResponse
 
 load_dotenv()
 
-# -----------------------
-# Configuration / Env
-# -----------------------
+# ---------- Config ----------
+REQUIRED_ENV = [
+    "GEMINI_API_KEY",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "BASE_URL",
+    "SPITCH_API_KEY",
+]
+for v in REQUIRED_ENV:
+    if not os.getenv(v):
+        raise RuntimeError(f"Missing environment variable: {v}")
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODyEL", "gemini-2.5-flash")
-VOICE_ID = os.getenv("VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 SPITCH_API_KEY = os.getenv("SPITCH_API_KEY")
-SPITCH_API_BASE = os.getenv("SPITCH_API_BASE", "https://api.spi-tch.com/v1")
-MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
 
-required_vars = ["GEMINI_API_KEY", "TWILIO_AUTH_TOKEN", "BASE_URL", "SPITCH_API_KEY"]
-for var in required_vars:
-    if not globals().get(var):
-        raise RuntimeError(f"Missing environment variable: {var}")
+MODEL = os.getenv("MODEeL", "gemini-2.5-flash")
+VOICE_ID = os.getenv("VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. "
+    "When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. "
+    "Do not include bullet points, asterisks, or special symbols."
+)
 
-os.makedirs(MEDIA_DIR, exist_ok=True)
+# Directory to store generated audio for Twilio to fetch
+AUDIO_DIR = os.path.join(os.getcwd(), "audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# ------------------------------------------------------------------
-# Language and voice maps
-# - LANGUAGE_MAP: DTMF choice -> (name, twiml-code, spitch/gemini-code)
-# - SPITCH_VOICE_MAP: language code -> spitch voice identifier (replace with real voice ids)
-# ------------------------------------------------------------------
+# ---------- Logging & App ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("conversation-relay")
+app = FastAPI()
+twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
+
+# ---------- Language maps ----------
+# LANGUAGE_MAP: digit -> (lang_name, twiml_code, spitch_lang_code)
 LANGUAGE_MAP = {
     "1": ("Yoruba", "yo-NG", "yo"),
     "2": ("Igbo", "ig-NG", "ig"),
@@ -48,194 +61,202 @@ LANGUAGE_MAP = {
     "4": ("English", "en-US", "en"),
 }
 
-# These are placeholder voice ids for Spitch. Replace them with actual voice ids from Spitch dashboard or API.
-SPITCH_VOICE_MAP = {
-    "yo": os.getenv("SPITCH_VOICE_YO", "yo_default_voice"),
-    "ig": os.getenv("SPITCH_VOICE_IG", "ig_default_voice"),
-    "ha": os.getenv("SPITCH_VOICE_HA", "ha_default_voice"),
-    "en": os.getenv("SPITCH_VOICE_EN", "jude"),
+# Spitch voice map (language -> voice name). Replace values with actual voice IDs/names from your Spitch account.
+VOICE_MAP = {
+    "yo": "yoruba_voice",   # example placeholder; replace with actual Spitch voice id for Yoruba
+    "ig": "igbo_voice",
+    "ha": "hausa_voice",
+    "en": "jude",           # example: "sade" per your example
 }
 
-# Conversation state
-LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, lang_code_spitch)
-CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {role, content}
+# State maps
+LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, spitch_lang_code)
+CONVERSATION_HISTORY: Dict[str, List[Dict[str, str]]] = {}  # CallSid -> list of messages
 
-# -----------------------
-# Logging + app
-# -----------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("spitch-conversation-relay")
-app = FastAPI()
-
-tenant_validator = RequestValidator(TWILIO_AUTH_TOKEN)
-
-# Configure Gemini client
+# ---------- Gemini setup ----------
 try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     raise RuntimeError(f"Failed to initialize Gemini client: {e}")
 
-# -----------------------
-# Helpers: Spitch (async httpx)
-# -----------------------
-
-async def spitch_translate(text: str, source: str, target: str) -> str:
-    """Call Spitch translate endpoint. Returns translated text or raises."""
-    url = f"{SPITCH_API_BASE}/translate"
-    payload = {"source": source, "target": target, "text": text}
-    headers = {"Authorization": f"Bearer {SPITCH_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, json=payload, headers=headers, timeout=30)
-    try:
-        data = r.json()
-    except Exception:
-        logger.error("Unexpected non-json response from Spitch translate: %s", r.text)
-        raise
-
-    # Try common fields
-    for key in ("translated_text", "translation", "text", "result", "translated"):
-        if key in data:
-            val = data[key]
-            if isinstance(val, dict) and "text" in val:
-                return val["text"]
-            if isinstance(val, str):
-                return val
-    # Fallback: try to find nested
-    if isinstance(data, dict):
-        # search for any string value
-        for v in data.values():
-            if isinstance(v, str) and len(v) > 0:
-                return v
-    raise RuntimeError("Could not parse Spitch translate response")
+# ---------- Helpers: Spitch API calls ----------
+SPITCH_BASE = "https://api.spi-tch.com/v1"
 
 
-async def spitch_transcribe_from_url(audio_url: str, language: Optional[str] = None) -> Dict[str, Any]:
-    """Call Spitch transcription using a remote URL. Returns dict with at least 'text' and optionally 'language'."""
-    url = f"{SPITCH_API_BASE}/transcriptions"
-    payload = {
-        "model": "mansa_v1",
-        "url": audio_url,
-        "language": language or "auto",
-        "timestamp": "sentence",
+def _spitch_headers():
+    return {
+        "Authorization": f"Bearer {SPITCH_API_KEY}",
+        "Content-Type": "application/json"
     }
-    headers = {"Authorization": f"Bearer {SPITCH_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, json=payload, headers=headers, timeout=60)
-    try:
-        data = r.json()
-    except Exception:
-        logger.error("Unexpected non-json response from Spitch transcriptions: %s", r.text)
-        raise
-
-    # attempt to parse common fields
-    text = None
-    language = None
-    for key in ("text", "transcript", "transcription", "result"):
-        if key in data:
-            if isinstance(data[key], dict) and "text" in data[key]:
-                text = data[key]["text"]
-            elif isinstance(data[key], str):
-                text = data[key]
-    # language fields
-    for key in ("language", "detected_language", "lang"):
-        if key in data:
-            language = data[key]
-            break
-
-    if not text:
-        # try scanning
-        for v in data.values():
-            if isinstance(v, str) and len(v) > 0:
-                text = v
-                break
-
-    return {"text": text or "", "language": language or ""}
 
 
-async def spitch_tts_to_url(text: str, language: str, voice: str, call_sid: str) -> str:
-    """Call Spitch TTS. Try multiple response shapes: url, base64 'audio', or direct audio bytes.
-    If audio bytes or base64 are returned, save locally and serve via /media/{filename} endpoint so Twilio can fetch it.
-    Returns a public URL to the audio file (either Spitch-hosted or our /media endpoint).
+def _write_audio_file(content: bytes, ext: str = "wav") -> str:
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    path = os.path.join(AUDIO_DIR, filename)
+    with open(path, "wb") as f:
+        f.write(content)
+    return path
+
+
+async def spitch_translate(text: str, source: str, target: str, timeout: int = 15) -> str:
     """
-    candidate_endpoints = ["/tts", "/synthesis", "/tts/synthesize"]
-    headers = {"Authorization": f"Bearer {SPITCH_API_KEY}", "Content-Type": "application/json"}
-    payload = {"text": text, "language": language, "voice": voice, "format": "mp3"}
-
-    async with httpx.AsyncClient() as client:
-        for ep in candidate_endpoints:
-            try:
-                r = await client.post(f"{SPITCH_API_BASE}{ep}", json=payload, headers=headers, timeout=60)
-            except httpx.HTTPStatusError:
-                continue
-            except Exception:
-                continue
-            # success-ish
-            # if content-type is audio/* -> save bytes
-            ctype = r.headers.get("content-type", "")
-            if ctype.startswith("audio/"):
-                filename = f"{call_sid}_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-                path = os.path.join(MEDIA_DIR, filename)
-                with open(path, "wb") as fh:
-                    fh.write(r.content)
-                return f"{BASE_URL}/media/{filename}"
-            # try json body with url or base64
-            try:
-                data = r.json()
-            except Exception:
-                logger.warning("TTS endpoint %s returned non-json non-audio response", ep)
-                continue
-
-            # common response shapes
-            if isinstance(data, dict) and "url" in data and isinstance(data["url"], str):
-                return data["url"]
-            if "audio" in data and isinstance(data["audio"], str):
-                # base64 audio
-                try:
-                    audio_b64 = data["audio"]
-                    audio_bytes = base64.b64decode(audio_b64)
-                    filename = f"{call_sid}_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-                    path = os.path.join(MEDIA_DIR, filename)
-                    with open(path, "wb") as fh:
-                        fh.write(audio_bytes)
-                    return f"{BASE_URL}/media/{filename}"
-                except Exception:
-                    logger.exception("Failed to decode base64 audio from spitch tts")
-            # sometimes nested
-            if "result" in data and isinstance(data["result"], dict) and "url" in data["result"]:
-                return data["result"]["url"]
-
-    raise RuntimeError("Spitch TTS failed or returned unknown format")
+    Calls Spitch translate endpoint to translate `text` from `source` -> `target`.
+    """
+    payload = {"source": source, "target": target, "text": text}
+    url = f"{SPITCH_BASE}/translate"
+    try:
+        def _req():
+            r = requests.post(url, json=payload, headers=_spitch_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        resp_json = await asyncio.to_thread(_req)
+        # Spitch translate response structure may vary; assume {"translatedText": "..."} or {"text": "..."}
+        translated = resp_json.get("translatedText") or resp_json.get("text") or resp_json.get("translation") or ""
+        if not translated:
+            # attempt to return first string value found
+            for v in resp_json.values():
+                if isinstance(v, str) and v.strip():
+                    translated = v
+                    break
+        return translated or text
+    except Exception as e:
+        logger.error("Spitch translate failed: %s", e, exc_info=True)
+        # On failure, fallback to original text to avoid blocking conversation
+        return text
 
 
-# -----------------------
-# Gemini helper
-# -----------------------
-async def gemini_chat_reply(messages: list, model_name: str = MODEL) -> str:
-    """Send messages to Gemini (assumes messages are in English already). Returns response text.
-    Keeps the system prompt minimal because we translate around it.
+async def spitch_synthesize(text: str, language: str, voice: Optional[str] = None, ext: str = "wav", timeout: int = 30) -> Optional[str]:
+    """
+    Calls Spitch synthesize endpoint and saves returned audio to disk, returning a public URL.
+    """
+    url = f"{SPITCH_BASE}/synthesize"
+    payload = {
+        "language": language,
+        "voice": voice or VOICE_MAP.get(language, "sade"),
+        "text": text
+    }
+    try:
+        def _req():
+            r = requests.post(url, json=payload, headers=_spitch_headers(), timeout=timeout)
+            r.raise_for_status()
+            return r.content
+        audio_bytes = await asyncio.to_thread(_req)
+        path = _write_audio_file(audio_bytes, ext)
+        # Expose via BASE_URL
+        filename = os.path.basename(path)
+        public_url = f"{BASE_URL}/audio/{filename}"
+        return public_url
+    except Exception as e:
+        logger.error("Spitch synthesize failed: %s", e, exc_info=True)
+        return None
+
+
+async def spitch_transcribe_audio_file(file_path: str, language: str, timeout: int = 30) -> Dict[str, Any]:
+    """
+    Demonstration helper if you wanted to call Spitch transcription on an audio file.
+    Not used in primary flow because you asked to keep Twilio built-in transcription.
+    """
+    url = f"{SPITCH_BASE}/transcriptions"
+    # The Spitch transcribe expects multipart/form-data with "content" file param and other payload fields.
+    try:
+        def _req():
+            with open(file_path, "rb") as fh:
+                files = {"content": fh}
+                data = {"model": "mansa_v1", "language": language, "timestamp": "sentence"}
+                r = requests.post(url, data=data, files=files, headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}, timeout=timeout)
+                r.raise_for_status()
+                return r.json()
+        return await asyncio.to_thread(_req)
+    except Exception as e:
+        logger.error("Spitch transcribe failed: %s", e, exc_info=True)
+        return {}
+
+
+# ---------- Helpers: Gemini chat ----------
+async def gemini_chat_reply(messages: List[Dict[str, str]], target_language_code: str = "en") -> str:
+    """
+    Sends chat to Gemini. messages is a list of {"role": "system|user|assistant", "content": "..."}
+    We ensure system prompt and language instruction are present.
     """
     try:
-        # Convert to Gemini format
+        # Append language instruction to system instruction and last user message
+        # Convert to gemini message format
         gemini_messages = []
         for msg in messages:
+            # keep system separately
+            if msg["role"] == "system":
+                continue
             role = "user" if msg["role"] == "user" else "model"
             gemini_messages.append({"role": role, "parts": [msg["content"]]})
 
-        model = genai.GenerativeModel(model_name, system_instruction="You are a helpful assistant. Reply in English.")
-        chat = model.start_chat(history=gemini_messages[:-1])
-        response = await chat.send_message_async(gemini_messages[-1]["parts"][0])
+        # Build model with system instruction
+        model = genai.GenerativeModel(
+            MODEL,
+            system_instruction=SYSTEM_PROMPT + f" Always respond in {target_language_code} language."
+        )
+
+        if not gemini_messages:
+            # fallback
+            chat = model.start_chat()
+            resp = await chat.send_message_async("Hello")
+            return resp.text
+
+        # Start a chat with all but last message in history, then send final message
+        history = gemini_messages[:-1]
+        final_msg = gemini_messages[-1]["parts"][0]
+
+        chat = model.start_chat(history=history)
+        response = await chat.send_message_async(final_msg)
         return response.text
     except Exception as e:
-        logger.exception("Gemini API error: %s", e)
+        logger.error(f"Gemini API error in gemini_chat_reply: {e}", exc_info=True)
         return "Sorry, I couldn't process your request. Please try again."
 
 
-# -----------------------
-# Twilio voice endpoints
-# -----------------------
+# ---------- Utilities ----------
+def split_text_into_chunks(text: str, max_chars: int = 2500) -> List[str]:
+    """
+    Splits text roughly into chunks not exceeding max_chars, trying to split on sentence boundaries.
+    """
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end == len(text):
+            chunks.append(text[start:end].strip())
+            break
+        # Try to find last sentence boundary within this window
+        window = text[start:end]
+        idx = max(window.rfind("."), window.rfind("!"), window.rfind("?"))
+        if idx <= 0:
+            # no sentence boundary; just split at max_chars
+            idx = end - start
+        chunks.append(text[start:start + idx + 1].strip())
+        start = start + idx + 1
+    return [c for c in chunks if c]
+
+
+# ---------- Routes ----------
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Spitch-Gemini Voice Relay. Use /health to check status."}
+    return {"message": "Welcome to the Gemini + Spitch Voice Relay API. Use /health to check status."}
+
+
+@app.get("/audio/{filename}")
+async def serve_audio(filename: str):
+    """
+    Serves generated audio files for Twilio to fetch/play. Ensure BASE_URL is public.
+    """
+    path = os.path.join(AUDIO_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Audio not found")
+    # Let FastAPI serve the file; Twilio will GET this URL
+    return FileResponse(path, media_type="audio/wav")
 
 
 @app.post("/voice")
@@ -244,17 +265,23 @@ async def voice_entry(request: Request):
         form_data = await request.form()
         signature = request.headers.get("X-Twilio-Signature", "")
         url = str(request.url)
-        if not tenant_validator.validate(url, dict(form_data), signature):
+        if not twilio_validator.validate(url, dict(form_data), signature):
             logger.warning("Invalid Twilio signature.")
             raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
         twiml = VoiceResponse()
-        gather = twiml.gather(num_digits=1, action="/process_language", method="POST", timeout=8)
+        gather = twiml.gather(
+            num_digits=1,
+            action="/process_language",
+            method="POST",
+            timeout=8
+        )
         gather.say("Welcome to Proxy. For Yoruba press one. For Igbo press two. For Hausa press three. For English press four.")
         twiml.redirect("/process_language_fallback")
+
         return Response(content=str(twiml), media_type="application/xml")
     except Exception as e:
-        logger.exception("Error in /voice: %s", e)
+        logger.error(f"Error in /voice endpoint: {e}", exc_info=True)
         twiml = VoiceResponse()
         twiml.say("An unexpected error occurred. Please try your call again.")
         return Response(content=str(twiml), media_type="application/xml", status_code=500)
@@ -262,10 +289,16 @@ async def voice_entry(request: Request):
 
 @app.post("/process_language_fallback")
 async def process_language_fallback(request: Request):
-    twiml = VoiceResponse()
-    twiml.say("Sorry, we did not receive any input. Redirecting you back to language selection.")
-    twiml.redirect("/voice")
-    return Response(content=str(twiml), media_type="application/xml")
+    try:
+        twiml = VoiceResponse()
+        twiml.say("Sorry, we did not receive any input. Redirecting you back to language selection.")
+        twiml.redirect("/voice")
+        return Response(content=str(twiml), media_type="application/xml")
+    except Exception as e:
+        logger.error(f"Error in /process_language_fallback: {e}", exc_info=True)
+        twiml = VoiceResponse()
+        twiml.say("An unexpected error occurred. Please try your call again.")
+        return Response(content=str(twiml), media_type="application/xml", status_code=500)
 
 
 @app.post("/process_language")
@@ -274,36 +307,40 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         form_data = await request.form()
         signature = request.headers.get("X-Twilio-Signature", "")
         url = str(request.url)
-        if not tenant_validator.validate(url, dict(form_data), signature):
+        if not twilio_validator.validate(url, dict(form_data), signature):
             logger.warning("Invalid Twilio signature.")
             raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
         twiml = VoiceResponse()
         if not (Digits and CallSid and Digits in LANGUAGE_MAP):
+            logger.warning("Invalid language selection or missing CallSid. Digits: %s", Digits)
             twiml.say("Invalid selection or call ID. Please try again.")
             twiml.redirect("/voice")
             return Response(content=str(twiml), media_type="application/xml")
 
-        lang_name, lang_code_twiml, lang_code_spitch = LANGUAGE_MAP[Digits]
-        LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
+        lang_name, lang_code_twiml, spitch_lang = LANGUAGE_MAP[Digits]
+        LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, spitch_lang)
         logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
 
         twiml.say(f"You selected {lang_name}. Connecting you now.")
 
         connect = twiml.connect()
-        # We deliberately avoid asking Twilio to transcribe (so we can use Spitch). Twilio will still forward audio events to our websocket.
         conversation_relay = connect.conversation_relay(
             url=f"wss://{urlparse(BASE_URL).netloc}/relay",
             interruptible="any",
             report_input_during_agent_speech="any",
             debug="speaker-events"
         )
-        # Keep Twilio TTS config minimal; we will supply audio ourselves via Spitch for the assistant replies.
-        conversation_relay.language(code=lang_code_twiml, tts_provider="elevenlabs", voice=VOICE_ID)
+        language = conversation_relay.language(
+            code=lang_code_twiml,
+            tts_provider="elevenlabs",  # Twilio conversation language block - Twilio will still use our audio files
+            voice=VOICE_ID,
+            transcription_provider="google"
+        )
 
         return Response(content=str(twiml), media_type="application/xml")
     except Exception as e:
-        logger.exception("Error in /process_language: %s", e)
+        logger.error(f"Error in /process_language endpoint: {e}", exc_info=True)
         twiml = VoiceResponse()
         twiml.say("An unexpected error occurred while processing your selection. Please try your call again.")
         return Response(content=str(twiml), media_type="application/xml", status_code=500)
@@ -312,44 +349,32 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
 @app.get("/health")
 async def health():
     status = {"status": "ok", "services": {}}
-    # Test Gemini connectivity (simple call)
+    # Test Gemini (light)
     try:
         model = genai.GenerativeModel(MODEL)
         chat = model.start_chat()
-        response = await chat.send_message_async("Health check ping")
+        response = await chat.send_message_async("Health check")
         status["services"]["gemini"] = "ok"
     except Exception as e:
-        logger.exception("Health check error for Gemini: %s", e)
         status["services"]["gemini"] = f"down: {e}"
-    # Test Spitch by making a lightweight call (optional)
+        logger.error(f"Health check failed for Gemini: {e}", exc_info=True)
+    # Spitch (light)
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(f"{SPITCH_API_BASE}/health", headers={"Authorization": f"Bearer {SPITCH_API_KEY}"}, timeout=5)
-            status["services"]["spitch"] = "ok" if r.status_code == 200 else f"unexpected status {r.status_code}"
+        # A simple GET to Spitch translate (we won't send heavy payload)
+        r = requests.get(f"{SPITCH_BASE}/health", headers=_spitch_headers(), timeout=5)
+        status["services"]["spitch"] = "ok" if r.status_code == 200 else f"warning: {r.status_code}"
     except Exception as e:
-        logger.warning("Spitch health check failed: %s", e)
         status["services"]["spitch"] = f"down: {e}"
     return status
 
 
-# Serve generated audio files
-@app.get("/media/{filename}")
-async def serve_media(filename: str):
-    path = os.path.join(MEDIA_DIR, filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, media_type="audio/mpeg")
-
-
-# -----------------------
-# WebSocket Relay Handler
-# -----------------------
+# ---------- WebSocket relay ----------
 @app.websocket("/relay")
 async def relay_websocket(websocket: WebSocket):
     await websocket.accept()
     call_sid = None
     message_queue = asyncio.Queue()
-    current_response_task = None
+    current_response_task: Optional[asyncio.Task] = None
 
     async def receiver():
         while True:
@@ -361,7 +386,7 @@ async def relay_websocket(websocket: WebSocket):
                 await message_queue.put(None)
                 break
             except Exception as e:
-                logger.exception("Receiver error: %s", e)
+                logger.error(f"Receiver error: {e}", exc_info=True)
                 await message_queue.put(None)
                 break
 
@@ -381,129 +406,107 @@ async def relay_websocket(websocket: WebSocket):
                 if not call_sid:
                     logger.error("Missing callSid in setup message.")
                     continue
-                CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": "You are a helpful assistant named Proxy."}]
+                CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
                 logger.info("Setup complete for CallSid %s", call_sid)
                 continue
 
             elif event_type == "prompt":
-                # This can contain either a pre-transcribed 'voicePrompt' or a media/audio url. We handle both.
-                if not call_sid:
-                    logger.warning("Prompt received before setup")
+                # Twilio should be providing the transcribed text in 'voicePrompt'
+                user_text = message.get("voicePrompt")
+                if not user_text or not user_text.strip():
+                    logger.warning("Received empty or missing voicePrompt. Skipping.")
                     continue
 
-                user_text = None
-                detected_lang = None
-
-                # If Twilio already provided a transcript
-                if message.get("voicePrompt"):
-                    user_text = message.get("voicePrompt").strip()
-                    logger.info("Received voicePrompt transcript: %s", user_text)
-                    # assume language == selection
-                    _, _, lang_code_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
-                    detected_lang = lang_code_spitch
-
-                else:
-                    # Try to discover audio url(s) in the Twilio event
-                    audio_url = (
-                        message.get("mediaUrl")
-                        or message.get("audioUrl")
-                        or (message.get("media") or {}).get("url")
-                        or (message.get("audio") or {}).get("url")
-                        or message.get("recordingUrl")
-                    )
-                    if not audio_url:
-                        logger.warning("No voicePrompt or audio URL found in prompt event")
-                        continue
-
-                    try:
-                        trans = await spitch_transcribe_from_url(audio_url)
-                        user_text = trans.get("text", "").strip()
-                        detected_lang = trans.get("language") or LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))[2]
-                        logger.info("Spitch transcription result: %s (lang=%s)", user_text, detected_lang)
-                    except Exception as e:
-                        logger.exception("Error transcribing audio: %s", e)
-                        await websocket.send_text(json.dumps({"type": "text", "token": "Sorry, I couldn't transcribe your speech.", "last": True}))
-                        continue
-
-                if not user_text:
-                    logger.warning("Empty user text after transcription/voicePrompt")
-                    continue
-
-                # Cancel any ongoing response if the user spoke
+                # Cancel previous response task if any (interrupt)
                 if current_response_task and not current_response_task.done():
                     logger.info("Interrupting previous response task.")
                     current_response_task.cancel()
 
-                # Determine language mapping
-                _, _, user_lang = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
+                # Resolve language selection for this call
+                lang_name, _, spitch_lang = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
+                history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
+                history.append({"role": "user", "content": user_text})
 
                 async def stream_response():
                     try:
-                        # If user language is not English, translate to English for Gemini
-                        if user_lang != "en":
-                            try:
-                                to_gemini = await spitch_translate(user_text, source=user_lang, target="en")
-                            except Exception as e:
-                                logger.exception("Translation to English failed: %s", e)
-                                # fallback to original text
-                                to_gemini = user_text
-                        else:
-                            to_gemini = user_text
+                        # 1) If user language is not English, translate incoming user_text -> English
+                        user_text_for_gemini = user_text
+                        if spitch_lang != "en":
+                            user_text_for_gemini = await spitch_translate(user_text, source=spitch_lang, target="en")
+                            logger.info("Translated user input to English for Gemini: %s", user_text_for_gemini)
 
-                        # Append to history (store user message in English so Gemini gets consistent context)
-                        hist = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": "You are a helpful assistant named Proxy."}])
-                        hist.append({"role": "user", "content": to_gemini})
+                        # 2) Send to Gemini (asking for an English response)
+                        gemini_messages = history.copy()
+                        # Ensure system present
+                        if not any(m["role"] == "system" for m in gemini_messages):
+                            gemini_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                        # Replace last user content with the translated-to-english content (so model sees English)
+                        gemini_messages[-1] = {"role": "user", "content": user_text_for_gemini}
 
-                        # Call Gemini
-                        response_en = await gemini_chat_reply(hist)
+                        gemini_reply = await gemini_chat_reply(gemini_messages, target_language_code="en")
+                        logger.info("Gemini replied (in English): %s", gemini_reply)
 
-                        # Store assistant reply in English
-                        hist.append({"role": "assistant", "content": response_en})
-                        CONVERSATION_HISTORY[call_sid] = hist[-20:]
+                        # 3) If user language is not English, translate Gemini reply back to user's language
+                        reply_for_user_text = gemini_reply
+                        if spitch_lang != "en":
+                            reply_for_user_text = await spitch_translate(gemini_reply, source="en", target=spitch_lang)
+                            logger.info("Translated Gemini reply to user language (%s): %s", spitch_lang, reply_for_user_text)
 
-                        # Translate back to user language if needed
-                        if user_lang != "en":
-                            try:
-                                response_local = await spitch_translate(response_en, source="en", target=user_lang)
-                            except Exception as e:
-                                logger.exception("Back-translation failed: %s", e)
-                                response_local = response_en
-                        else:
-                            response_local = response_en
+                        # 4) Chunk response text to reduce latency and synthesize each chunk
+                        chunks = split_text_into_chunks(reply_for_user_text, max_chars=2000)
+                        logger.info("Reply split into %d chunk(s) for synthesis.", len(chunks))
 
-                        # Generate TTS audio via Spitch
-                        voice_to_use = SPITCH_VOICE_MAP.get(user_lang, SPITCH_VOICE_MAP.get("en"))
-                        try:
-                            audio_url = await spitch_tts_to_url(response_local, language=user_lang, voice=voice_to_use, call_sid=call_sid)
-                        except Exception as e:
-                            logger.exception("Spitch TTS failed: %s", e)
-                            audio_url = None
+                        for idx, chunk in enumerate(chunks):
+                            # Choose voice for user's language
+                            voice_name = VOICE_MAP.get(spitch_lang, VOICE_MAP.get("en", "sade"))
+                            audio_url = await spitch_synthesize(chunk, language=spitch_lang, voice=voice_name)
+                            if audio_url:
+                                # Send audio event to Twilio via websocket so the conversation can play it
+                                await websocket.send_text(json.dumps({
+                                    "type": "audio",
+                                    "audio_url": audio_url,
+                                    "chunk_index": idx,
+                                    "last": idx == len(chunks) - 1
+                                }))
+                                logger.info("Sent audio chunk %d to Twilio for CallSid %s", idx, call_sid)
+                            else:
+                                # If synthesis failed, fall back to sending text
+                                await websocket.send_text(json.dumps({
+                                    "type": "text",
+                                    "token": chunk,
+                                    "last": idx == len(chunks) - 1
+                                }))
+                                logger.warning("Synthesis failed; sent text chunk to Twilio instead.")
 
-                        # Send both a text token (fallback) and audio url (preferred)
-                        payload = {
-                            "type": "text",
-                            "token": response_local,
-                            "last": True,
-                            "assistant_text_en": response_en,
-                        }
-                        # If we have audio, include it in a separate field. Twilio Conversation Relay may accept a media payload.
-                        if audio_url:
-                            payload.update({"type": "audio", "url": audio_url, "contentType": "audio/mpeg"})
-
-                        await websocket.send_text(json.dumps(payload))
-                        logger.info("Response sent to Twilio for CallSid %s", call_sid)
+                        # 5) Update conversation history and persist last 20 messages
+                        history.append({"role": "assistant", "content": gemini_reply})
+                        CONVERSATION_HISTORY[call_sid] = history[-20:]
+                        logger.info("Completed response for CallSid %s", call_sid)
 
                     except asyncio.CancelledError:
                         logger.warning("Response task was cancelled.")
+                        # Optionally notify Twilio that response was interrupted
+                        try:
+                            await websocket.send_text(json.dumps({"type": "text", "token": "Response interrupted by user.", "last": True}))
+                        except Exception:
+                            pass
                         raise
                     except Exception as e:
-                        logger.exception("Error during response streaming: %s", e)
-                        await websocket.send_text(json.dumps({"type": "text", "token": "Sorry, a temporary error occurred. Please try again.", "last": True}))
+                        logger.error(f"Error during response streaming: {e}", exc_info=True)
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "type": "text",
+                                "token": "Sorry, a temporary error occurred. Please try again.",
+                                "last": True
+                            }))
+                        except Exception:
+                            pass
 
                 current_response_task = asyncio.create_task(stream_response())
                 continue
 
             elif event_type == "speaker":
+                # If Twilio notifies the client is speaking, cancel current response
                 if message.get("event") == "clientSpeaking" and current_response_task and not current_response_task.done():
                     logger.info("Client speaking detected. Cancelling ongoing response.")
                     current_response_task.cancel()
@@ -514,7 +517,7 @@ async def relay_websocket(websocket: WebSocket):
                 continue
 
             elif event_type == "error":
-                logger.error("Error received from Twilio: %s", message.get("error"))
+                logger.error("Error from Twilio side: %s", message.get("error"))
                 continue
 
             elif event_type == "call_ended":
@@ -526,7 +529,7 @@ async def relay_websocket(websocket: WebSocket):
             logger.warning("Unknown event type received: %s", event_type)
 
     except Exception as e:
-        logger.exception("Unexpected error in WebSocket handler: %s", e)
+        logger.error(f"Unexpected error in WebSocket handler: {e}", exc_info=True)
     finally:
         if current_response_task:
             current_response_task.cancel()
@@ -535,6 +538,7 @@ async def relay_websocket(websocket: WebSocket):
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
+        # Close websocket if still open
         try:
             if websocket.client_state.name == "CONNECTED":
                 await websocket.close()
