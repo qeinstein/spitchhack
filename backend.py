@@ -99,12 +99,10 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
 def spitch_transcribe(audio_data: bytes, lang: str) -> str:
     """Transcribe audio data using Spitch API."""
     try:
-        # Correctly pass audio data with the keyword 'content'
+        # Correctly pass audio data with the keyword 'content' and remove unsupported parameters
         resp = spitch_client.speech.transcribe(
             content=audio_data,
-            language=lang,
-            audio_format="ulaw", # Twilio's default encoding
-            sample_rate=8000
+            language=lang
         )
         t = getattr(resp, "text", None)
         if not t:
