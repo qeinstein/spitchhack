@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 # ---- Config ----
 load_dotenv()
 
-app = FastAPI()
 # Validate environment variables
 required_vars = [
     "SPITCH_API_KEY",
@@ -100,8 +99,9 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
 def spitch_transcribe(audio_data: bytes, lang: str) -> str:
     """Transcribe audio data using Spitch API."""
     try:
+        # Correctly pass audio data with the keyword 'content'
         resp = spitch_client.speech.transcribe(
-            audio_data=audio_data,
+            content=audio_data,
             language=lang,
             audio_format="ulaw", # Twilio's default encoding
             sample_rate=8000
