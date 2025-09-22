@@ -1,6 +1,7 @@
 import os
 import logging
 import base64
+import struct
 from typing import Dict, Any
 from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 # ---- Config ----
 load_dotenv()
 
-app = FastAPI()
+app=FastAPI()
 
 # Validate environment variables
 required_vars = [
@@ -98,12 +99,38 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
         logger.error(f"Spitch TTS failed: {e}")
         raise RuntimeError(f"TTS error: {e}")
 
+def convert_ulaw_to_wav(ulaw_data: bytes) -> bytes:
+    """Converts ulaw audio bytes to a WAV file format with a proper header."""
+    sample_rate = 8000
+    channels = 1
+    # WAV file header format
+    # See http://soundfile.sapp.org/doc/WaveFormat/
+    header = b'RIFF'  # RIFF chunk
+    header += struct.pack('<I', 36 + len(ulaw_data))  # File size
+    header += b'WAVE'  # WAVE chunk
+    header += b'fmt '  # fmt chunk
+    header += struct.pack('<I', 18)  # Chunk size
+    header += struct.pack('<H', 6)  # Audio format (6 for ulaw)
+    header += struct.pack('<H', channels)  # Number of channels
+    header += struct.pack('<I', sample_rate)  # Sample rate
+    header += struct.pack('<I', sample_rate * channels)  # Byte rate
+    header += struct.pack('<H', channels)  # Block align
+    header += struct.pack('<H', 8)  # Bits per sample
+    header += struct.pack('<H', 0)  # Extra param size
+    header += b'data'  # data chunk
+    header += struct.pack('<I', len(ulaw_data))  # Data size
+    
+    return header + ulaw_data
+
 def spitch_transcribe(audio_data: bytes, lang: str) -> str:
     """Transcribe audio data using Spitch API."""
     try:
-        # Correctly pass audio data with the keyword 'content' and remove unsupported parameters
+        # Convert the raw ulaw audio from Twilio to a proper WAV file format
+        wav_audio = convert_ulaw_to_wav(audio_data)
+        
+        # Pass the WAV data with the keyword 'content'
         resp = spitch_client.speech.transcribe(
-            content=audio_data,
+            content=wav_audio,
             language=lang
         )
         t = getattr(resp, "text", None)
