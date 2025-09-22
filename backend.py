@@ -54,7 +54,7 @@ twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 
 # ---- Language map ----
 LANGUAGE_MAP = {
-    "1": ("Yoruba", "yo-NG", "yo"),  # (lang_name, lang_code_twiml, lang_code_spitch)
+    "1": ("Yoruba", "yo", "yo"),  # (lang_name, lang_code_twiml, lang_code_spitch)
     "2": ("Igbo", "ig-NG", "ig"),
     "3": ("Hausa", "ha-NG", "ha"),
     "4": ("English", "en-US", "en")
@@ -176,11 +176,13 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         report_input_during_agent_speech="any",
         debug="speaker-events"
     )
+    logger.info("completed convo relay stuff")
     # Set only transcription provider for custom TTS via play
     language = conversation_relay.language(
         code=lang_code_twiml,
         transcription_provider="google"
     )
+    logger.info("did transcription stuff")
 
     return Response(content=str(twiml), media_type="application/xml")
 
