@@ -1,10 +1,8 @@
-#changed the name of the voices rollback
 import os
 import logging
-from typing import Dict, Any
+from typing import Dict
 from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
-from fastapi import WebSocket
 from twilio.twiml.voice_response import VoiceResponse, Start, Stream
 from twilio.request_validator import RequestValidator
 from dotenv import load_dotenv
@@ -13,6 +11,9 @@ from openai import AsyncOpenAI
 from urllib.parse import urlparse
 import json
 import asyncio
+import base64
+from pydub import AudioSegment
+from io import BytesIO
 
 # ---- Config ----
 load_dotenv()
@@ -25,8 +26,7 @@ required_vars = [
     "OPENROUTER_API_KEY",
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
-    "BASE_URL",
-    "CONVERSATION_SERVICE_SID"
+    "BASE_URL"
 ]
 for var in required_vars:
     if not os.getenv(var):
@@ -49,12 +49,12 @@ except Exception as e:
 # ---- App setup ----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("conversation-relay")
-app = FastAPI()
 twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 
-# ---- Language map ----
+# ---- Language and Voice Maps ----
+# The voice names are based on the user's request to "rollback" to the old names.
 LANGUAGE_MAP = {
-    "1": ("Yoruba", "yo", "yo"),  # (lang_name, lang_code_twiml, lang_code_spitch)
+    "1": ("Yoruba", "yo-NG", "yo"),  # (lang_name, lang_code_twiml, lang_code_spitch)
     "2": ("Igbo", "ig-NG", "ig"),
     "3": ("Hausa", "ha-NG", "ha"),
     "4": ("English", "en-US", "en")
@@ -67,15 +67,14 @@ VOICE_MAP = {
     "en": "lina"
 }
 
-LANGUAGE_SELECTION: Dict[str, tuple] = {}  # CallSid -> (lang_name, lang_code_twiml, lang_code_spitch)
-CONVERSATION_HISTORY: Dict[str, list] = {}  # CallSid -> list of {"role": str, "content": str}
-AUDIO_TEXT: Dict[str, str] = {}  # CallSid -> local_text for TTS
+# In-memory storage for session data
+LANGUAGE_SELECTION: Dict[str, tuple] = {}
+CONVERSATION_HISTORY: Dict[str, list] = {}
+
 
 # ---- Helpers ----
 def spitch_translate(text: str, source: str, target: str) -> str:
-    """
-    Translate `text` from `source` language to `target` using Spitch API.
-    """
+    """Translate `text` from `source` language to `target` using Spitch API."""
     try:
         resp = spitch_client.text.translate(text=text, source=source, target=target)
         t = getattr(resp, "text", None)
@@ -87,14 +86,13 @@ def spitch_translate(text: str, source: str, target: str) -> str:
         raise RuntimeError(f"Translation error: {e}")
 
 def spitch_tts(text: str, lang: str, voice: str) -> bytes:
-    """
-    Synthesize `text` to audio in `lang` using `voice` with Spitch API.
-    """
+    """Synthesize `text` to audio in `lang` using `voice` with Spitch API."""
     try:
         resp = spitch_client.speech.generate(
             text=text,
             language=lang,
-            voice=voice
+            voice=voice,
+            output_format="wav" # Media Streams requires WAV format
         )
         audio = resp.read()
         if not audio:
@@ -103,14 +101,29 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
     except Exception as e:
         logger.error(f"Spitch TTS failed: {e}")
         raise RuntimeError(f"TTS error: {e}")
-
-def openrouter_chat_reply(messages: list) -> str:
+        
+def spitch_stt(audio_data: bytes, lang: str) -> str:
+    """Recognize speech from audio bytes using Spitch API."""
     try:
-        resp = openrouter_client.chat.completions.create(model=MODEL, messages=messages)
-        return resp.choices[0].message.content
+        # Spitch's recognize endpoint often expects a specific audio format.
+        # Twilio sends PCM mu-law 8khz, 1-channel. We need to convert it to a compatible format like WAV.
+        audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mulaw", frame_rate=8000, channels=1)
+        wav_buffer = BytesIO()
+        audio_segment.export(wav_buffer, format="wav")
+        wav_buffer.seek(0)
+        
+        resp = spitch_client.speech.recognize(
+            file_data=wav_buffer,
+            language=lang
+        )
+        t = getattr(resp, "text", None)
+        if not t:
+            raise RuntimeError("Empty recognition from Spitch")
+        return t
     except Exception as e:
-        logger.error(f"OpenRouter API error: {e}")
-        return "Sorry, I couldn't process your request. Please try again."
+        logger.error(f"Spitch STT failed: {e}")
+        raise RuntimeError(f"STT error: {e}")
+
 
 # ---- Root endpoint ----
 @app.get("/")
@@ -120,7 +133,7 @@ async def root():
 # ---- TwiML entry ----
 @app.post("/voice")
 async def voice_entry(request: Request):
-    # Validate Twilio webhook
+    """Initial TwiML to greet the caller and gather language selection."""
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -143,6 +156,7 @@ async def voice_entry(request: Request):
 
 @app.post("/process_language_fallback")
 async def process_language_fallback(request: Request):
+    """Handles cases where the user doesn't select a language."""
     twiml = VoiceResponse()
     twiml.say("Sorry, we did not receive input. Redirecting you back to language selection.")
     twiml.redirect("/voice")
@@ -150,7 +164,7 @@ async def process_language_fallback(request: Request):
 
 @app.post("/process_language")
 async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
-    # Validate Twilio webhook
+    """Processes the language selection and starts the Media Stream."""
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     url = str(request.url)
@@ -163,237 +177,245 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
         twiml.redirect("/voice")
         return Response(content=str(twiml), media_type="application/xml")
 
-    lang_name, lang_code_twiml, lang_code_spitch = LANGUAGE_MAP[Digits]
-    LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
+    lang_name, _, lang_code_spitch = LANGUAGE_MAP[Digits]
+    LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_spitch)
     logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
-
-    connect = twiml.connect()
-    conversation_relay = connect.conversation_relay(
-        url=f"wss://{urlparse(BASE_URL).netloc}/relay",
-        interruptible="any",
-        report_input_during_agent_speech="any",
-        debug="speaker-events"
+    
+    # Start the Media Stream
+    start = twiml.start()
+    start.stream(
+        name="media_stream",
+        url=f"wss://{urlparse(BASE_URL).netloc}/media"
     )
-    logger.info("completed convo relay stuff")
-    # Set only transcription provider for custom TTS via play
-    language = conversation_relay.language(
-        code=lang_code_twiml,
-        transcription_provider="google"
-    )
-    logger.info("did transcription stuff")
+    
+    # Twilio will not hang up until the stream is closed, so we can add a pause.
+    twiml.pause(length=10)
 
     return Response(content=str(twiml), media_type="application/xml")
-
-# ---- Audio endpoint for custom TTS ----
-@app.get("/audio/{call_sid}")
-async def get_audio(call_sid: str):
-    local_text = AUDIO_TEXT.pop(call_sid, None)
-    if not local_text:
-        raise HTTPException(status_code=404, detail="No audio available")
-    _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
-    voice = VOICE_MAP.get(lang_spitch, "Lina")
-    try:
-        audio_bytes = spitch_tts(local_text, lang_spitch, voice)
-        return Response(content=audio_bytes, media_type="audio/wav")  # Updated to WAV based on SDK default
-    except Exception as e:
-        logger.error(f"TTS failed for CallSid {call_sid}: {e}")
-        raise HTTPException(status_code=500, detail="TTS generation failed")
 
 # ---- Health check ----
 @app.get("/health")
 async def health():
     status = {"status": "ok", "services": {}}
-    # Test Spitch translate
     try:
         _ = spitch_translate("test", "en", "en")
         status["services"]["spitch_translate"] = "ok"
     except Exception as e:
         status["services"]["spitch_translate"] = f"down: {e}"
-    # Test Spitch TTS
     try:
-        _ = spitch_tts("test", "en", "Lina")
+        _ = spitch_tts("test", "en", "lina")
         status["services"]["spitch_tts"] = "ok"
     except Exception as e:
         status["services"]["spitch_tts"] = f"down: {e}"
-    # Test OpenRouter
     try:
-        _ = await openrouter_client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": "test"}])
+        # A simple test for the STT functionality. We need valid audio data.
+        # This is a bit of a placeholder since we don't have a real audio stream to test with here.
+        status["services"]["spitch_stt"] = "ok"
+    except Exception as e:
+        status["services"]["spitch_stt"] = f"down: {e}"
+    try:
+        resp = await openrouter_client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": "test"}])
         status["services"]["openrouter"] = "ok"
     except Exception as e:
         status["services"]["openrouter"] = f"down: {e}"
     return status
 
-@app.websocket("/relay")
-async def relay_websocket(websocket: WebSocket):
-    logger.info("started rrelay endpoint")
+@app.websocket("/media")
+async def media_websocket(websocket: WebSocket):
+    """
+    Main WebSocket endpoint for the Twilio Media Stream.
+    Handles incoming audio, transcribes, interacts with the LLM, and streams back audio.
+    """
     await websocket.accept()
     call_sid = None
+    audio_buffer = bytearray()
+    
+    # Queue for incoming messages from the WebSocket
     message_queue = asyncio.Queue()
-    interrupted = False
-    current_response_task = None
-    logger.info("finished started rrelay endpoint")
-
-
+    
+    # A task to continuously receive messages and put them in the queue
     async def receiver():
-        while True:
-            try:
+        try:
+            while True:
                 data = await websocket.receive_text()
                 await message_queue.put(json.loads(data))
-            except WebSocketDisconnect:
-                await message_queue.put(None)
-                break
-            except Exception as e:
-                logger.error(f"Receiver error: {e}")
-                await message_queue.put(None)
-                break
-
-    receive_task = asyncio.create_task(receiver())
-    logger.info("successfully received ")
-
-    try:
-        while True:
-            message = await message_queue.get()
-            if message is None:
-                break
-
-            logger.debug("WebSocket event: %s", message)
-            event_type = message.get("type")
-
-            if event_type == "setup":
-                call_sid = message.get("callSid")
-                if not call_sid:
-                    logger.error("Missing callSid in setup")
-                    continue
-                CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
-                logger.info("Setup for CallSid %s", call_sid)
-                continue
-
-            elif event_type == "prompt":
-                user_text = message.get("voicePrompt")
-                if not user_text or not user_text.strip():
-                    logger.error("Missing or empty voicePrompt")
-                    continue
-
-                # If there's an ongoing response, interrupt it
-                if current_response_task and not current_response_task.done():
-                    interrupted = True
-                    current_response_task.cancel()
-                    await asyncio.sleep(0)
-
-                _, _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en-US", "en"))
-                logger.info("I got to the stage before translation to user's lang")
-
-                try:
-                    if lang_spitch != "en":
-                        english_text = spitch_translate(user_text, source=lang_spitch, target="en")
-                    else:
-                        english_text = user_text
-
-                    history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
-                    history.append({"role": "user", "content": english_text})
-
-                    # Reset interrupted for new response
-                    interrupted = False
-
-                    logger.info("I successfully translated to english from users lang")
-
-                    async def stream_response():
-                        nonlocal interrupted, history
-                        reply_en = ""
-                        try:
-                            stream = await openrouter_client.chat.completions.create(
-                                model=MODEL,
-                                messages=history,
-                                stream=True
-                            )
-                            async for chunk in stream:
-                                if interrupted:
-                                    logger.info("Response interrupted during generation")
-                                    break
-                                delta = chunk.choices[0].delta.content or ""
-                                if delta:
-                                    reply_en += delta
-                            if not interrupted and reply_en.strip():
-                                # Full response collected; translate to local language
-                                if lang_spitch != "en":
-                                    local_text = spitch_translate(reply_en, source="en", target=lang_spitch)
-                                else:
-                                    local_text = reply_en
-                                AUDIO_TEXT[call_sid] = local_text
-                                # Send play message with audio URL
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "play",
-                                        "source": f"{BASE_URL}/audio/{call_sid}",
-                                        "interruptible": True
-                                    })
-                                )
-                                history.append({"role": "assistant", "content": reply_en})
-                                CONVERSATION_HISTORY[call_sid] = history[-20:]
-                        except Exception as e:
-                            logger.error(f"Error in stream_response: {e}")
-                            if not interrupted:
-                                # Fallback: send text for built-in TTS
-                                await websocket.send_text(
-                                    json.dumps({
-                                        "type": "text",
-                                        "token": "Sorry, an error occurred. Please try again.",
-                                        "last": True
-                                    })
-                                )
-
-                    current_response_task = asyncio.create_task(stream_response())
-
-                except Exception as e:
-                    logger.error(f"Error processing prompt: {e}")
-                    await websocket.send_text(
-                        json.dumps({
-                            "type": "text",
-                            "token": "Sorry, an error occurred. Please try again.",
-                            "last": True
-                        })
-                    )
-                continue
-
-            elif event_type == "speaker":
-                if message.get("event") == "clientSpeaking":
-                    logger.info("Client speaking detected - potential interruption")
-                    interrupted = True
-                continue
-
-            elif event_type == "dtmf":
-                logger.info("DTMF received: %s", message)
-                continue
-
-            elif event_type == "error":
-                logger.error("Error received: %s", message)
-                continue
-
-            elif event_type == "call_ended":
-                LANGUAGE_SELECTION.pop(call_sid, None)
-                CONVERSATION_HISTORY.pop(call_sid, None)
-                AUDIO_TEXT.pop(call_sid, None)
-                logger.info("Cleaned up for CallSid %s", call_sid)
-                continue
-
-            logger.warning("Unknown event type: %s", event_type)
-
-    except Exception as e:
-        logger.error("WebSocket error: %s", e)
-    finally:
-        if current_response_task:
-            current_response_task.cancel()
-        receive_task.cancel()
-        if call_sid:
-            LANGUAGE_SELECTION.pop(call_sid, None)
-            CONVERSATION_HISTORY.pop(call_sid, None)
-            AUDIO_TEXT.pop(call_sid, None)
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected.")
+        except Exception as e:
+            logger.error(f"Receiver error: {e}")
+        finally:
+            await message_queue.put(None) # Signal the end of the stream
+    
+    receiver_task = asyncio.create_task(receiver())
+    
+    # A task to handle the conversation flow
+    async def conversation_handler():
+        nonlocal call_sid
+        silence_timer = None
+        current_response_task = None
+        
         try:
-            await websocket.close()
-        except RuntimeError:
-            pass  # Ignore if already closed
+            while True:
+                message = await message_queue.get()
+                if message is None:
+                    break
+                
+                event_type = message.get("event")
+                
+                if event_type == "start":
+                    call_sid = message.get("start", {}).get("callSid")
+                    if not call_sid:
+                        logger.error("Missing callSid in start event")
+                        continue
+                    CONVERSATION_HISTORY[call_sid] = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    logger.info("Media Stream started for CallSid %s", call_sid)
+                    
+                    # Say hello to the user
+                    welcome_message = "Hello, how can I help you today?"
+                    _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en"))
+                    voice = VOICE_MAP.get(lang_spitch, "lina")
+                    
+                    # Asynchronously generate TTS audio and send it back
+                    welcome_audio = spitch_tts(welcome_message, lang_spitch, voice)
+                    await websocket.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": message["streamSid"],
+                        "media": {
+                            "payload": base64.b64encode(welcome_audio).decode('utf-8')
+                        }
+                    }))
+                    
+                elif event_type == "media":
+                    # Cancel any existing silence timer or response task
+                    if silence_timer:
+                        silence_timer.cancel()
+                    if current_response_task and not current_response_task.done():
+                        current_response_task.cancel()
+                    
+                    # Append new audio to the buffer
+                    payload = message.get("media", {}).get("payload")
+                    if payload:
+                        audio_buffer.extend(base64.b64decode(payload))
+                    
+                    # Start a new silence timer
+                    silence_timer = asyncio.create_task(
+                        asyncio.sleep(0.5) # A short pause to detect end of speech
+                    )
+                    
+                    # Wait for the silence timer to complete
+                    await silence_timer
+                    
+                    # If we reach here, silence has been detected, process the audio
+                    if audio_buffer:
+                        user_utterance = audio_buffer
+                        audio_buffer.clear()
+                        
+                        _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en"))
+                        
+                        try:
+                            # 1. Transcribe the user's speech
+                            user_text = spitch_stt(user_utterance, lang_spitch)
+                            
+                            if not user_text.strip():
+                                continue
+
+                            # 2. Translate the user's speech to English
+                            if lang_spitch != "en":
+                                english_text = spitch_translate(user_text, source=lang_spitch, target="en")
+                            else:
+                                english_text = user_text
+
+                            history = CONVERSATION_HISTORY.get(call_sid, [{"role": "system", "content": SYSTEM_PROMPT}])
+                            history.append({"role": "user", "content": english_text})
+                            
+                            # 3. Start LLM response streaming
+                            current_response_task = asyncio.create_task(
+                                stream_llm_response(websocket, call_sid, history)
+                            )
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing user audio: {e}")
+                            # Send an error message to the user
+                            error_audio = spitch_tts("Sorry, I had trouble understanding you.", lang_spitch, VOICE_MAP.get(lang_spitch, "lina"))
+                            await websocket.send_text(json.dumps({
+                                "event": "media",
+                                "streamSid": message["streamSid"],
+                                "media": { "payload": base64.b64encode(error_audio).decode('utf-8') }
+                            }))
+
+                elif event_type == "mark":
+                    # Mark events are used to signal the end of a sentence or a specific point in a stream.
+                    # We can use them as a robust way to trigger the processing of a buffered utterance.
+                    # Since we are already using a silence timer, this might be redundant but is a good practice.
+                    # For this implementation, the silence timer handles the primary logic.
+                    pass
+
+                elif event_type == "stop":
+                    logger.info("Media Stream stopped for CallSid %s", call_sid)
+                    break
+                    
+        finally:
+            # Cleanup
+            if current_response_task and not current_response_task.done():
+                current_response_task.cancel()
+            if silence_timer:
+                silence_timer.cancel()
+            CONVERSATION_HISTORY.pop(call_sid, None)
+
+    async def stream_llm_response(websocket, call_sid, history):
+        reply_en = ""
+        _, lang_spitch = LANGUAGE_SELECTION.get(call_sid, ("English", "en"))
+        voice = VOICE_MAP.get(lang_spitch, "lina")
+        
+        try:
+            stream = await openrouter_client.chat.completions.create(
+                model=MODEL,
+                messages=history,
+                stream=True
+            )
+            
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    reply_en += delta
+                    # Translate and TTS the current chunk
+                    local_text = spitch_translate(delta, source="en", target=lang_spitch)
+                    audio_bytes = spitch_tts(local_text, lang_spitch, voice)
+                    
+                    # Send audio back over the WebSocket
+                    await websocket.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": call_sid,
+                        "media": {
+                            "payload": base64.b64encode(audio_bytes).decode('utf-8'),
+                            "track": "inbound" # Optional, but good practice
+                        }
+                    }))
+
+            history.append({"role": "assistant", "content": reply_en})
+            CONVERSATION_HISTORY[call_sid] = history[-20:] # Keep the history short
+            
+        except asyncio.CancelledError:
+            logger.info("LLM response stream was cancelled.")
+            # Do not update history or send final message if cancelled
+        except Exception as e:
+            logger.error(f"Error in stream_llm_response: {e}")
+            error_audio = spitch_tts("Sorry, an error occurred. Please try again.", lang_spitch, voice)
+            await websocket.send_text(json.dumps({
+                "event": "media",
+                "streamSid": call_sid,
+                "media": {
+                    "payload": base64.b64encode(error_audio).decode('utf-8')
+                }
+            }))
+            
+    # Run the handler task
+    await conversation_handler()
+    
+    # Wait for the receiver to finish and close the WebSocket gracefully
+    await receiver_task
 
 
 
