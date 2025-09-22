@@ -14,8 +14,7 @@ import asyncio
 import base64
 from pydub import AudioSegment
 from io import BytesIO
-import soundfile as sf
-import numpy as np
+
 # ---- Config ----
 load_dotenv()
 
@@ -104,34 +103,19 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
         raise RuntimeError(f"TTS error: {e}")
         
 def spitch_stt(audio_data: bytes, lang: str) -> str:
-    """
-    Recognize speech from audio bytes using Spitch API with SoundFile.
-    
-    This function converts the raw mu-law audio from Twilio into a format
-    that SoundFile can process and save as a WAV file.
-    """
+    """Recognize speech from audio bytes using Spitch API."""
     try:
-        # Convert the raw mu-law bytes into a numpy array of signed 16-bit integers
-        # Mu-law audio from Twilio is 8-bit, 8kHz, 1 channel. We need to decode it.
-        # This decoding process is not built into SoundFile, so we have to do it manually.
-        # This is where SoundFile is less convenient than Pydub for this specific task.
-        mu_law_array = np.frombuffer(audio_data, dtype=np.uint8)
-        # Manually decode from mu-law to signed 16-bit PCM
-        pcm_array = ((mu_law_array.astype(np.int16) - 128) * 256).astype(np.int16)
-
-        # Create an in-memory buffer to write the WAV file to
+        # Spitch's recognize endpoint often expects a specific audio format.
+        # Twilio sends PCM mu-law 8khz, 1-channel. We need to convert it to a compatible format like WAV.
+        audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mulaw", frame_rate=8000, channels=1)
         wav_buffer = BytesIO()
-
-        # Write the PCM data to the in-memory buffer as a WAV file
-        sf.write(wav_buffer, pcm_array, 8000, format='WAV', subtype='PCM_16')
+        audio_segment.export(wav_buffer, format="wav")
         wav_buffer.seek(0)
         
-        # Use the WAV data to call the Spitch recognize endpoint
         resp = spitch_client.speech.recognize(
             file_data=wav_buffer,
             language=lang
         )
-        
         t = getattr(resp, "text", None)
         if not t:
             raise RuntimeError("Empty recognition from Spitch")
@@ -139,6 +123,7 @@ def spitch_stt(audio_data: bytes, lang: str) -> str:
     except Exception as e:
         logger.error(f"Spitch STT failed: {e}")
         raise RuntimeError(f"STT error: {e}")
+
 
 # ---- Root endpoint ----
 @app.get("/")
