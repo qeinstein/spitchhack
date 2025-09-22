@@ -10,6 +10,7 @@ from spitch import Spitch
 from openai import AsyncOpenAI
 from urllib.parse import urlparse
 import json
+import audioop
 import asyncio
 import base64
 from pydub import AudioSegment
