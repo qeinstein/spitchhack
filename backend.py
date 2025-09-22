@@ -14,7 +14,8 @@ import asyncio
 import base64
 from pydub import AudioSegment
 from io import BytesIO
-
+import soundfile as sf
+import numpy as np
 # ---- Config ----
 load_dotenv()
 
@@ -104,26 +105,25 @@ def spitch_tts(text: str, lang: str, voice: str) -> bytes:
         
 def spitch_stt(audio_data: bytes, lang: str) -> str:
     """
-    Recognize speech from audio bytes using Spitch API.
+    Recognize speech from audio bytes using Spitch API with SoundFile.
     
-    This function now uses Pydub to handle the audio format conversion.
-    Twilio Media Streams send audio as raw mu-law at 8kHz, which Spitch 
-    might not accept directly. We convert it to WAV first.
+    This function converts the raw mu-law audio from Twilio into a format
+    that SoundFile can process and save as a WAV file.
     """
     try:
-        # Pydub can read raw mu-law data by specifying the format and parameters.
-        audio_segment = AudioSegment.from_file(
-            BytesIO(audio_data), 
-            format="raw", # Use 'raw' for uncompressed audio data
-            frame_rate=8000, 
-            channels=1, 
-            sample_width=1 # mu-law is 8-bit, so sample_width is 1
-        )
-        
-        # Now, export the raw data to a WAV format in memory, which is universally
-        # compatible with most ASR APIs like Spitch.
+        # Convert the raw mu-law bytes into a numpy array of signed 16-bit integers
+        # Mu-law audio from Twilio is 8-bit, 8kHz, 1 channel. We need to decode it.
+        # This decoding process is not built into SoundFile, so we have to do it manually.
+        # This is where SoundFile is less convenient than Pydub for this specific task.
+        mu_law_array = np.frombuffer(audio_data, dtype=np.uint8)
+        # Manually decode from mu-law to signed 16-bit PCM
+        pcm_array = ((mu_law_array.astype(np.int16) - 128) * 256).astype(np.int16)
+
+        # Create an in-memory buffer to write the WAV file to
         wav_buffer = BytesIO()
-        audio_segment.export(wav_buffer, format="wav")
+
+        # Write the PCM data to the in-memory buffer as a WAV file
+        sf.write(wav_buffer, pcm_array, 8000, format='WAV', subtype='PCM_16')
         wav_buffer.seek(0)
         
         # Use the WAV data to call the Spitch recognize endpoint
