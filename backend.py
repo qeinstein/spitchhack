@@ -19,6 +19,8 @@ import google.generativeai as genai
 # ----------------------
 load_dotenv()
 
+app = FastAPI()
+
 REQUIRED_VARS = ["GEMINI_API_KEY", "TWILIO_AUTH_TOKEN", "BASE_URL", "SPITCH_API_KEY"]
 for v in REQUIRED_VARS:
     if not os.getenv(v):
