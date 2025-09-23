@@ -322,9 +322,11 @@ async def relay_websocket(websocket: WebSocket):
         if call_sid:
             LANGUAGE_SELECTION.pop(call_sid, None)
             CONVERSATION_HISTORY.pop(call_sid, None)
-        await websocket.close()
-
-
+        try:
+            if websocket.application_state == WebSocketState.CONNECTED:
+                await websocket.close()
+        except Exception:
+            pass
 
 
 
