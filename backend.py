@@ -93,10 +93,13 @@ def spitch_tts(text: str, voice_id: str, lang: str = "en") -> bytes:
         "voice": voice_id,  # must be one of the listed voices for that language
         "text": text
     }
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Spitch TTS error: {resp.status_code} {resp.text}")
-    return resp.content  # raw wav bytes
+    try:
+        resp = requests.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"Spitch TTS request failed. Payload={payload}", exc_info=True)
+        raise
+    return resp.content
 
 # ---- Endpoints ----
 
