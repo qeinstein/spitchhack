@@ -198,6 +198,7 @@ async def relay_websocket(websocket: WebSocket):
                 break
 
             event_type = message.get("type")
+            logger.info("event type is %s", event_type)
 
             if event_type == "setup":
                 call_sid = message.get("callSid")
