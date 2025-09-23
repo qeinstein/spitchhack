@@ -83,7 +83,7 @@ def spitch_translate(text: str, source: str, target: str) -> str:
     return t
 
 def spitch_tts(text: str, voice_id: str, lang: str = "en") -> bytes:
-    url = "https://api.spi-tch.com/v1/speech"
+    url = "https://api.spi-tch.com/v1/synthesize"
     headers = {
         "Authorization": f"Bearer {SPITCH_API_KEY}",
         "Content-Type": "application/json"
@@ -100,7 +100,6 @@ def spitch_tts(text: str, voice_id: str, lang: str = "en") -> bytes:
         logger.error(f"Spitch TTS request failed. Payload={payload}", exc_info=True)
         raise
     return resp.content
-
 # ---- Endpoints ----
 
 @app.post("/voice")
