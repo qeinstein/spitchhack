@@ -260,27 +260,27 @@ async def relay_websocket(websocket: WebSocket):
 
                                 # Now produce audio via Spitch TTS for partial_local
                                 voice_for_lang = SPITCH_VOICE_MAP.get(lang_spitch, SPITCH_VOICE_MAP["en"])
-                                try:
-                                    audio_bytes = spitch_tts(partial_local, voice_for_lang, lang=lang_spitch)
-                                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                                    await websocket.send_text(
-                                        json.dumps({
-                                            "type": "audio",
-                                            "audio": audio_b64,
-                                            "last": False
-                                        })
-                                    )
-                                except Exception as e:
-                                    logger.error(f"TTS error: {e}")
-                                    # fallback: send text (if any), so the flow can still continue
-                                    await websocket.send_text(
-                                        json.dumps({
-                                            "type": "text",
-                                            "token": partial_local,
-                                            "last": False,
-                                            "interruptible": True
-                                        })
-                                    )
+                                # try:
+                                #     audio_bytes = spitch_tts(partial_local, voice_for_lang, lang=lang_spitch)
+                                #     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                                #     await websocket.send_text(
+                                #         json.dumps({
+                                #             "type": "audio",
+                                #             "audio": audio_b64,
+                                #             "last": False
+                                #         })
+                                #     )
+                                # except Exception as e:
+                                # logger.error(f"TTS error: {e}")
+                                # fallback: send text (if any), so the flow can still continue
+                                await websocket.send_text(
+                                    json.dumps({
+                                        "type": "text",
+                                        "token": partial_local,
+                                        "last": False,
+                                        "interruptible": True
+                                    })
+                                )
 
                         if not interrupted:
                             # signal done
