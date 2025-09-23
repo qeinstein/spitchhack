@@ -58,7 +58,7 @@ twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 #     "4": ("English", "en")
 # }
 LANGUAGE_MAP = {
-    "1": ("Yoruba", "yo-NG", "yo"), #aiit so this is now (BCP-47 code, spitch code)
+    "1": ("Yoruba", "en-US", "en"), #aiit so this is now (BCP-47 code, spitch code)
     "2": ("Igbo", "ig-NG", "ig"),
     "3": ("Hausa", "ha-NG", "ha"),
     "4": ("English", "en-US", "en")
@@ -145,7 +145,7 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
 
     lang_name, lang_code_twiml, lang_code_spitch = LANGUAGE_MAP[Digits]
     LANGUAGE_SELECTION[CallSid] = (lang_name, lang_code_twiml, lang_code_spitch)
-    logger.info("Language set for CallSid %s -> %s", CallSid, lang_name, lang_code_twiml, lang_code_spitch)
+    logger.info("Language set for CallSid %s -> %s", CallSid, lang_name)
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
 
