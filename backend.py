@@ -23,7 +23,6 @@ required_vars = [
     "TWILIO_AUTH_TOKEN",
     "BASE_URL",
     "CONVERSATION_SERVICE_SID",
-    "VOICE_ID"
 ]
 for var in required_vars:
     if not os.getenv(var):
