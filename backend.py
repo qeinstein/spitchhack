@@ -35,7 +35,7 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 MODEL = os.getenv("MODEL", "")
 VOICE_ID = os.getenv("VOICE_ID")
-SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols."
+SYSTEM_PROMPT = "You are a helpful assistant named Proxy. This conversation is being translated to voice, so answer carefully. When you respond, please spell out all numbers, for example twenty not 20. Do not include emojis in your responses. Do not include bullet points, asterisks, or special symbols. and respond in the language the user messages you in"
 
 # ---- Clients ----
 try:
@@ -58,7 +58,7 @@ twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
 #     "4": ("English", "en")
 # }
 LANGUAGE_MAP = {
-    "1": ("Yoruba", "en-US", "en"), #aiit so this is now (BCP-47 code, spitch code)
+    "1": ("Yoruba", "yo-NG", "yo"), #aiit so this is now (BCP-47 code, spitch code)
     "2": ("Igbo", "ig-NG", "ig"),
     "3": ("Hausa", "ha-NG", "ha"),
     "4": ("English", "en-US", "en")
@@ -129,7 +129,11 @@ async def process_language_fallback(request: Request):
     return Response(content=str(twiml), media_type="application/xml")
 
 @app.post("/process_language")
-async def process_language(request: Request, Digits: str = Form(None), CallSid: str = Form(None)):
+async def process_language(
+    request: Request,
+    Digits: str = Form(None),
+    CallSid: str = Form(None)
+):
     # Validate Twilio webhook
     form_data = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
@@ -149,33 +153,29 @@ async def process_language(request: Request, Digits: str = Form(None), CallSid: 
 
     twiml.say(f"You selected {lang_name}. Connecting you now.")
 
-    # # Fixing BASE_URL parsing
-    # parsed = urlparse(BASE_URL)
-    # host = parsed.netloc or parsed.path  # in case BASE_URL had no scheme
-    # # Use websocket URL derived from BASE_URL
-    # ws_url = f"wss://{host}/relay"
-
-    # start = Start()
-    # stream = Stream(url=ws_url)
-    # start.append(stream)
-    # twiml.append(start)
-
+    # ConversationRelay setup
     connect = twiml.connect()
     conversation_relay = connect.conversation_relay(
         url=f"wss://{urlparse(BASE_URL).netloc}/relay",
         interruptible="any",
         report_input_during_agent_speech="any",
         debug="speaker-events"
-        )
-    language = conversation_relay.language(
-        code=lang_code_twiml,
-        tts_provider="elevenlabs",
-        voice=VOICE_ID,
-        transcription_provider="google"
-        #both google and elevenlabs support yoruba/igbo/hausa
     )
 
+    # ✅ Only add <Language> for English (Twilio supports en-US)
+    if lang_code_twiml == "en-US":
+        conversation_relay.language(
+            code="en-US",
+            tts_provider="elevenlabs",
+            transcription_provider="google"
+        )
+    else:
+        # ❌ Skip <Language> for Yoruba/Igbo/Hausa
+        # Their transcription + TTS will be handled via Spitch/ElevenLabs in your backend
+        logger.info("Skipping <Language> block for %s (unsupported by Twilio)", lang_name)
+
     return Response(content=str(twiml), media_type="application/xml")
+
 
 
 # ---- Health check ----
