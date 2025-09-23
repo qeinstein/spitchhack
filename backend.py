@@ -81,18 +81,21 @@ def spitch_translate(text: str, source: str, target: str) -> str:
         raise RuntimeError("Empty translation from Spitch")
     return t
 
-def spitch_tts(text: str, voice_id: str, lang: str = "en-US") -> bytes:
-    """
-    Synthesize text to speech using Spitch TTS.
-    Returns raw audio bytes (e.g. PCM16, or whatever format you choose).
-    """
-    resp = spitch_client.speech.synthesize(
-        text=text,
-        voice=voice_id,
-        language=lang,
-        format="pcm16"   # or another format that Twilio can accept
-    )
-    return resp.audio
+def spitch_tts(text: str, voice_id: str, lang: str = "en") -> bytes:
+    url = "https://api.spi-tch.com/v1/synthesize"
+    headers = {
+        "Authorization": f"Bearer {SPITCH_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "language": lang,   # e.g. "yo", "ig", "ha", "en"
+        "voice": voice_id,
+        "text": text
+    }
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Spitch TTS error: {resp.status_code} {resp.text}")
+    return resp.content  # raw audio bytes
 
 # ---- Endpoints ----
 
