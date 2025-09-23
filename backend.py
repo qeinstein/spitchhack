@@ -83,7 +83,7 @@ def spitch_translate(text: str, source: str, target: str) -> str:
     return t
 
 def spitch_tts(text: str, voice_id: str, lang: str = "en") -> bytes:
-    url = "https://api.spi-tch.com/v1/synthesize"
+    url = "https://api.spi-tch.com/v1/speech"
     headers = {
         "Authorization": f"Bearer {SPITCH_API_KEY}",
         "Content-Type": "application/json"
@@ -93,7 +93,7 @@ def spitch_tts(text: str, voice_id: str, lang: str = "en") -> bytes:
         "voice": voice_id,  # must be one of the listed voices for that language
         "text": text
     }
-    resp = requests.post(url, json=payload)
+    resp = requests.post(url, headers=headers, json=payload)
     if resp.status_code != 200:
         raise RuntimeError(f"Spitch TTS error: {resp.status_code} {resp.text}")
     return resp.content  # raw wav bytes
