@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import asyncio
+import requests
 import base64
 from typing import Dict, Any
 from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
